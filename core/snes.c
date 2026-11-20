@@ -402,6 +402,9 @@ static uint8_t cartRead(Snes* s, uint32_t bank, uint32_t adr) {
   off = cartRomOffset(c, bank, adr);
   if(off >= 0) {
     if(s->romTrace) s->romTrace[off >> 8] = 1;
+#ifdef NS_ROM_HOOK
+    NS_ROM_HOOK((uint32_t)off); /* PC experiments: every ROM read, in order (with romTrace set) */
+#endif
     const uint8_t* block = c->block[off >> NS_ROM_BLOCK_SHIFT];
     if(block) return block[off & (NS_ROM_BLOCK - 1)];
     /* a part of the game that is not in the pack: nothing sensible can

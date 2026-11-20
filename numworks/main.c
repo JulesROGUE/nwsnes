@@ -185,8 +185,22 @@ int main(int argc, char* argv[]) {
     p = putNum(p, pack.info.romSize / 1024);
     text(6, buf);
   }
-  text(7, "0: stats   Maison: quitter");
-  text(9, "Appuyez sur OK");
+#ifndef NS_SIM
+  {
+    /* Room for external apps, deduced from where this app sits: apps start on
+     * a 64 KB boundary and (assumption) their area runs to the end of the
+     * 4 MB slot the system is in. Shown so that it can be checked against
+     * what snes2nw assumes (--flash-kb). */
+    const uintptr_t appStart = (uintptr_t)eadk_app_name & ~(uintptr_t)0xffff;
+    const uintptr_t slotEnd = (appStart | 0x3fffff) + 1;
+    p = putStr(buf, "Flash (estim.): ");
+    p = putNum(p, (uint32_t)(slotEnd - appStart) / 1024);
+    putStr(p, " Ko");
+    text(pack.blockTable ? 7 : 6, buf);
+  }
+#endif
+  text(8, "0: stats   Maison: quitter");
+  text(10, "Appuyez sur OK");
   waitKey();
   eadk_display_push_rect_uniform(eadk_screen_rect, eadk_color_black);
 
