@@ -90,7 +90,8 @@ eadk_keyboard_state_t eadk_keyboard_scan(void) {
   /* the start screen waits for a key press and release */
   static int startKey;
   if(startKey < 6) return (startKey++ >= 2 && startKey <= 5) ? (eadk_keyboard_state_t)1 << eadk_key_ok : 0;
-  if(loops >= 5 && loops < 8) keys |= (eadk_keyboard_state_t)1 << eadk_key_zero; /* statistics on */
+  /* statistics on, unless NS_SIM_NOSTATS is set (they show as plain bars here, there is no font) */
+  if(loops >= 10 && loops < 13 && !getenv("NS_SIM_NOSTATS")) keys |= (eadk_keyboard_state_t)1 << eadk_key_zero;
   if(loops >= 60 && (loops / 40) % 2) keys |= (eadk_keyboard_state_t)1 << eadk_key_right;
   if(loops >= 200) keys |= (eadk_keyboard_state_t)1 << eadk_key_back; /* SNES A */
   return keys;
