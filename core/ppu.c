@@ -114,6 +114,11 @@ void ppu_buildLuts(Ppu* ppu) {
     ppu->lut5[c] = (uint8_t)(c8 >> 3);
     ppu->lut6[c] = (uint8_t)(c8 >> 2);
   }
+  for(int i = 0; i < 0x100; i++) {
+    const uint16_t c = ppu->cgram[i];
+    ppu->pal565[i] = (uint16_t)(
+      (ppu->lut5[c & 0x1f] << 11) | (ppu->lut6[(c >> 5) & 0x1f] << 5) | ppu->lut5[(c >> 10) & 0x1f]);
+  }
 }
 
 static void getLevels(const Ppu* ppu, Levels* lv) {
@@ -197,10 +202,15 @@ static inline const uint8_t* tileData(const Snes* s, uint32_t wordAdr) {
   return s->pager.ptr[NS_VP_VRAM + (wordAdr >> 7)] + ((wordAdr & 0x7f) << 1);
 }
 
-/* one row of a tile -> 8 palette-relative pixels, left to right */
-static inline void expandRow(const uint8_t* tile, int row, int bpp, bool hflip, uint8_t px[8]) {
+/* one row of a tile -> 8 palette-relative pixels, left to right.
+ * Returns false (px untouched) when the whole row is transparent. */
+static inline bool expandRow(const uint8_t* tile, int row, int bpp, bool hflip, uint8_t px[8]) {
   const uint32_t* hi = hflip ? kSpreadFlip : kSpread;
   const uint8_t* p = tile + row * 2;
+  uint32_t any = p[0] | p[1];
+  if(bpp > 2) any |= p[16] | p[17];
+  if(bpp > 4) any |= p[32] | p[33] | p[48] | p[49];
+  if(!any) return false;
   uint32_t l = 0, r = 0; /* left and right 4 pixels */
   for(int plane = 0; plane < bpp; plane += 2, p += 16) {
     uint32_t b0 = p[0], b1 = p[1];
@@ -214,6 +224,7 @@ static inline void expandRow(const uint8_t* tile, int row, int bpp, bool hflip, 
   }
   px[0] = (uint8_t)l; px[1] = (uint8_t)(l >> 8); px[2] = (uint8_t)(l >> 16); px[3] = (uint8_t)(l >> 24);
   px[4] = (uint8_t)r; px[5] = (uint8_t)(r >> 8); px[6] = (uint8_t)(r >> 16); px[7] = (uint8_t)(r >> 24);
+  return true;
 }
 
 /* The common case: 8x8 or 16x16 tiles, no mosaic, no offset-per-tile. */
@@ -252,13 +263,14 @@ static void drawBg(Snes* s, int y, uint16_t* dst, int layer, int bpp, const Leve
       const int row = (tile & 0x8000) ? 7 - (int)(ly & 7) : (int)(ly & 7);
       const uint8_t* data = tileData(s, bg->tileAdr + tileNum * tileWords);
       uint8_t px[8];
-      expandRow(data, row, bpp, (tile & 0x4000) != 0, px);
-      const uint16_t z = (tile & 0x2000) ? zhi : zlo;
-      const uint32_t pal = (uint32_t)(paletteBase + (int)(((tile & 0x1c00) >> 10) << paletteShift));
-      uint16_t* d = dst + x;
-      for(int k = 0; k < count; k++) {
-        const uint8_t p = px[first + k];
-        if(p && z > d[k]) d[k] = (uint16_t)(z | ((pal + p) & 0xff));
+      if(expandRow(data, row, bpp, (tile & 0x4000) != 0, px)) {
+        const uint16_t z = (tile & 0x2000) ? zhi : zlo;
+        const uint32_t pal = (uint32_t)(paletteBase + (int)(((tile & 0x1c00) >> 10) << paletteShift));
+        uint16_t* d = dst + x;
+        for(int k = 0; k < count; k++) {
+          const uint8_t p = px[first + k];
+          if(p && z > d[k]) d[k] = (uint16_t)(z | ((pal + p) & 0xff));
+        }
       }
       x += count;
     }
@@ -458,14 +470,39 @@ static void drawMode7(Snes* s, uint16_t* dst, int layer, const Levels* lv, const
 
 /* Fills objBuf for one line. Same selection rules as LakeSnes: at most 32
  * sprites and 34 tile slivers per line, later sprites are dropped first. */
+/* lists the sprites that are on screen on at least one line */
+static void buildObjList(Ppu* ppu) {
+  int n = 0;
+  for(int i = 0; i < 128; i++) {
+    const int index = i * 2;
+    const int y = ppu->oam[index] >> 8;
+    const int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+    const int spriteHeight = ppu->objInterlace ? spriteSize / 2 : spriteSize;
+    /* rows wrap at 256: a sprite low enough comes back in at the top */
+    if(y >= NS_SCREEN_H_OVERSCAN && y + spriteHeight <= 256) continue;
+    int x = ppu->oam[index] & 0xff;
+    x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
+    if(x > 255) x -= 512;
+    if(x <= -spriteSize) continue;
+    ppu->objList[n++] = (uint8_t)index;
+  }
+  ppu->objCount = (uint8_t)n;
+  ppu->objListDirty = false;
+}
+
 static bool evaluateSprites(Snes* s, int line, const Levels* lv) {
   Ppu* ppu = &s->ppu;
-  uint8_t index = ppu->objPriority ? (ppu->oamAdr & 0xfe) : 0;
+  /* with priority rotation the scan starts anywhere: take the long road */
+  const bool rotate = ppu->objPriority;
+  if(!rotate && ppu->objListDirty) buildObjList(ppu);
+  const int scanCount = rotate ? 128 : ppu->objCount;
+  uint8_t index = rotate ? (ppu->oamAdr & 0xfe) : 0;
   int spritesFound = 0;
   int tilesFound = 0;
   bool any = false;
   uint8_t foundSprites[32];
-  for(int i = 0; i < 128; i++) {
+  for(int i = 0; i < scanCount; i++) {
+    if(!rotate) index = ppu->objList[i];
     uint8_t y = (uint8_t)(ppu->oam[index] >> 8);
     uint8_t row = (uint8_t)(line - y);
     int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
@@ -517,13 +554,16 @@ static bool evaluateSprites(Snes* s, int line, const Levels* lv) {
         uint8_t usedTile = (uint8_t)((((tile >> 4) + (row / 8)) << 4) | (((tile & 0xf) + (usedCol / 8)) & 0xf));
         const uint8_t* data = tileData(s, objAdr + (uint32_t)usedTile * 16);
         uint8_t px[8];
-        expandRow(data, row & 7, 4, hFlipped, px);
-        int from = col + x < 0 ? -(col + x) : 0;
-        int to = col + x > 248 ? 256 - (col + x) : 8;
-        for(int k = from; k < to; k++) {
-          if(px[k]) {
-            ppu->objBuf[col + x + k] = (uint16_t)(z | (color + px[k]));
-            any = true;
+        if(expandRow(data, row & 7, 4, hFlipped, px)) {
+          int from = col + x < 0 ? -(col + x) : 0;
+          int to = col + x > 248 ? 256 - (col + x) : 8;
+          if(col + x + from < ppu->objMinX) ppu->objMinX = (uint16_t)(col + x + from);
+          if(col + x + to > ppu->objMaxX) ppu->objMaxX = (uint16_t)(col + x + to);
+          for(int k = from; k < to; k++) {
+            if(px[k]) {
+              ppu->objBuf[col + x + k] = (uint16_t)(z | (color + px[k]));
+              any = true;
+            }
           }
         }
       }
@@ -536,7 +576,10 @@ static bool evaluateSprites(Snes* s, int line, const Levels* lv) {
 static void mergeSprites(const Ppu* ppu, uint16_t* dst, const Spans* sp) {
   for(int i = 0; i < sp->n; i++) {
     if(sp->masked & (1 << i)) continue;
-    for(int x = sp->edge[i]; x < sp->edge[i + 1]; x++) {
+    /* only the columns sprites were drawn in */
+    int x = sp->edge[i] > ppu->objMinX ? sp->edge[i] : ppu->objMinX;
+    const int end = sp->edge[i + 1] < ppu->objMaxX ? sp->edge[i + 1] : ppu->objMaxX;
+    for(; x < end; x++) {
       uint16_t o = ppu->objBuf[x];
       if(o > dst[x]) dst[x] = o;
     }
@@ -591,22 +634,29 @@ void ppu_runLine(Snes* s, int line) {
   Levels lv;
   getLevels(ppu, &lv);
   if(ppu->objBufDirty) {
-    memset(ppu->objBuf, 0, sizeof(ppu->objBuf));
+    if(ppu->objMaxX > ppu->objMinX) {
+      memset(ppu->objBuf + ppu->objMinX, 0, (size_t)(ppu->objMaxX - ppu->objMinX) * sizeof(uint16_t));
+    }
     ppu->objBufDirty = false;
   }
+  ppu->objMinX = NS_SCREEN_W;
+  ppu->objMaxX = 0;
   if(evaluateSprites(s, line - 1, &lv)) ppu->objBufDirty = true;
   if(ppu->mode == 7) calculateMode7Starts(ppu, line);
 
   drawScreen(s, line, false, &lv);
 
-  bool anyMath = false;
-  for(int i = 0; i < 6; i++) anyMath |= ppu->mathEnabled[i];
-  const bool useSub = anyMath && ppu->addSubscreen && ppu->preventMathMode != 3;
+  /* which layer codes take part in colour math (code 6, sprites with a
+   * palette below 4, never does) */
+  uint32_t mathMask = 0;
+  for(int i = 0; i < 6; i++) mathMask |= (uint32_t)ppu->mathEnabled[i] << i;
+  const bool useSub = mathMask && ppu->addSubscreen && ppu->preventMathMode != 3;
   if(useSub) drawScreen(s, line, true, &lv);
 
   const uint16_t* zm = ppu->zbuf[0];
   const uint16_t* zs = ppu->zbuf[1];
   const uint16_t* cgram = ppu->cgram;
+  const uint16_t* pal565 = ppu->pal565;
   const uint8_t* lut5 = ppu->lut5;
   const uint8_t* lut6 = ppu->lut6;
   Spans cw;
@@ -614,7 +664,7 @@ void ppu_runLine(Snes* s, int line) {
   for(int i = 0; i < cw.n; i++) {
     const bool inWindow = cw.masked & (1 << i);
     const bool clip = ppu->clipMode == 3 || (ppu->clipMode == 2 && inWindow) || (ppu->clipMode == 1 && !inWindow);
-    const bool mathAllowed = anyMath && !(
+    const bool mathAllowed = mathMask && !(
       ppu->preventMathMode == 3 || (ppu->preventMathMode == 2 && inWindow) || (ppu->preventMathMode == 1 && !inWindow)
     );
     int x = cw.edge[i];
@@ -623,16 +673,26 @@ void ppu_runLine(Snes* s, int line) {
       if(clip) {
         for(; x < end; x++) out[x] = 0;
       } else {
-        for(; x < end; x++) {
-          const uint16_t c = cgram[zm[x] & 0xff];
-          out[x] = (uint16_t)((lut5[c & 0x1f] << 11) | (lut6[(c >> 5) & 0x1f] << 5) | lut5[(c >> 10) & 0x1f]);
-        }
+        for(; x < end; x++) out[x] = pal565[zm[x] & 0xff];
       }
       continue;
     }
+    /* blending is the expensive part, and neighbouring pixels are very often
+     * the same colours (sky, flat areas): keep the last result at hand */
+    uint32_t lastKey = 0xffffffffu;
+    uint16_t lastOut = 0;
     for(; x < end; x++) {
       const uint16_t z = zm[x];
-      const int mainLayer = (z >> 8) & 0xf;
+      if(!((mathMask >> ((z >> 8) & 0xf)) & 1)) {
+        out[x] = clip ? 0 : pal565[z & 0xff];
+        continue;
+      }
+      const uint32_t key = (z & 0xffu) | (ppu->addSubscreen ? (uint32_t)zs[x] << 8 : 0u);
+      if(key == lastKey) {
+        out[x] = lastOut;
+        continue;
+      }
+      lastKey = key;
       int r = 0, g = 0, b = 0;
       if(!clip) {
         const uint16_t c = cgram[z & 0xff];
@@ -640,36 +700,35 @@ void ppu_runLine(Snes* s, int line) {
         g = (c >> 5) & 0x1f;
         b = (c >> 10) & 0x1f;
       }
-      if(mainLayer < 6 && ppu->mathEnabled[mainLayer]) {
-        int r2 = ppu->fixedColorR, g2 = ppu->fixedColorG, b2 = ppu->fixedColorB;
-        bool half = ppu->halfColor;
-        if(ppu->addSubscreen) {
-          const uint16_t z2 = zs[x];
-          if(((z2 >> 8) & 0xf) != LAYER_BACKDROP) {
-            const uint16_t c2 = cgram[z2 & 0xff];
-            r2 = c2 & 0x1f;
-            g2 = (c2 >> 5) & 0x1f;
-            b2 = (c2 >> 10) & 0x1f;
-          } else {
-            half = false; /* the fixed colour standing in for the sub screen is never halved */
-          }
-        }
-        if(ppu->subtractColor) {
-          r -= r2; g -= g2; b -= b2;
+      int r2 = ppu->fixedColorR, g2 = ppu->fixedColorG, b2 = ppu->fixedColorB;
+      bool half = ppu->halfColor;
+      if(ppu->addSubscreen) {
+        const uint16_t z2 = zs[x];
+        if(((z2 >> 8) & 0xf) != LAYER_BACKDROP) {
+          const uint16_t c2 = cgram[z2 & 0xff];
+          r2 = c2 & 0x1f;
+          g2 = (c2 >> 5) & 0x1f;
+          b2 = (c2 >> 10) & 0x1f;
         } else {
-          r += r2; g += g2; b += b2;
+          half = false; /* the fixed colour standing in for the sub screen is never halved */
         }
-        if(half) {
-          r >>= 1; g >>= 1; b >>= 1;
-        }
-        if(r > 31) r = 31;
-        if(g > 31) g = 31;
-        if(b > 31) b = 31;
-        if(r < 0) r = 0;
-        if(g < 0) g = 0;
-        if(b < 0) b = 0;
       }
-      out[x] = (uint16_t)((lut5[r] << 11) | (lut6[g] << 5) | lut5[b]);
+      if(ppu->subtractColor) {
+        r -= r2; g -= g2; b -= b2;
+      } else {
+        r += r2; g += g2; b += b2;
+      }
+      if(half) {
+        r >>= 1; g >>= 1; b >>= 1;
+      }
+      if(r > 31) r = 31;
+      if(g > 31) g = 31;
+      if(b > 31) b = 31;
+      if(r < 0) r = 0;
+      if(g < 0) g = 0;
+      if(b < 0) b = 0;
+      lastOut = (uint16_t)((lut5[r] << 11) | (lut6[g] << 5) | lut5[b]);
+      out[x] = lastOut;
     }
   }
   s->putLine(s->user, line - 1, out);

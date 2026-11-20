@@ -46,6 +46,10 @@ typedef struct Cpu {
   bool nmiWanted;
   bool intWanted;
   bool resetWanted;
+  /* wait-loop detection: state at the last backward jump */
+  uint32_t loopTarget;
+  uint32_t loopSig[3];
+  uint32_t loopWrites;
 } Cpu;
 
 void cpu_reset(Snes* s, bool hard);
@@ -209,10 +213,17 @@ typedef struct Ppu {
   uint16_t zbuf[2][NS_SCREEN_W]; /* main screen, sub screen */
   uint16_t objBuf[NS_SCREEN_W];
   bool objBufDirty;
+  uint16_t objMinX, objMaxX; /* columns of objBuf in use: [objMinX, objMaxX) */
   uint8_t lutBrightness; /* brightness the tables below were built for (0xff: none) */
   uint8_t lut5[32];      /* 5-bit channel -> 5-bit output (red, blue) */
   uint8_t lut6[32];      /* 5-bit channel -> 6-bit output (green) */
   uint16_t line[NS_SCREEN_W]; /* RGB565 output of the current line */
+  uint16_t pal565[0x100];     /* cgram at the current brightness, as RGB565 */
+  /* sprites that can show up somewhere on screen, in oam order: saves
+   * scanning all 128 on every line */
+  uint8_t objList[128];
+  uint8_t objCount;
+  bool objListDirty;
 } Ppu;
 
 void ppu_reset(Snes* s);
@@ -330,6 +341,13 @@ struct Snes {
   /* misc */
   bool fastMem;
   uint8_t openBus;
+  /* speed-ups (see snes.c). speedHacks may be cleared to get the exact,
+   * slower behaviour, which the tests compare against. */
+  bool speedHacks;
+  uint16_t codeBank;      /* bank codePtr is valid for, 0xffff: none */
+  uint8_t codeCycles;     /* access time of that bank */
+  const uint8_t* codePtr; /* codePtr[adr] for adr 0x8000-0xffff of codeBank */
+  uint32_t writeCount;    /* bus writes by the cpu, to spot loops that only wait */
 };
 
 /* ROM description, as found in the pack or guessed from a raw ROM image */
@@ -358,6 +376,8 @@ void snes_cpuIdle(Snes* s, bool waiting);
 uint8_t snes_cpuRead(Snes* s, uint32_t adr);
 void snes_cpuWrite(Snes* s, uint32_t adr, uint8_t val);
 void snes_syncCycles(Snes* s, bool start, int syncCycles);
+void snes_setCodeBank(Snes* s, uint32_t bank);
+void snes_skipToEvent(Snes* s);
 
 static inline void snes_addCycles(Snes* s, int cycles) {
   s->hPos = (uint16_t)(s->hPos + cycles);

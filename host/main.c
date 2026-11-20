@@ -147,6 +147,8 @@ static bool loadScript(const char* path, Inputs* in, uint32_t frames) {
 
 /* -------------------------------------------------------------- session -- */
 
+static bool g_exact; /* --exact: no speed-ups in the device configuration */
+
 static Session* sessionNew(const NsPack* pack, uint32_t poolPages, bool refPpu) {
   Session* se = calloc(1, sizeof(Session));
   se->poolBytes = poolPages * NS_PAGE_SIZE;
@@ -154,6 +156,8 @@ static Session* sessionNew(const NsPack* pack, uint32_t poolPages, bool refPpu) 
   snes_init(&se->snes, se->pool, se->poolBytes, putLine, se);
   pack_attach(pack, &se->snes);
   se->snes.refPpu = refPpu;
+  /* the reference session never uses speed-ups */
+  if(refPpu || g_exact) se->snes.speedHacks = false;
   snes_reset(&se->snes, true);
   return se;
 }
@@ -218,7 +222,8 @@ static void usage(void) {
     "  --budget-kb N       flash budget of that pack (default 2304)\n"
     "  --min-pool          find the smallest RAM pool that completes the run\n"
     "  --collect-each      device: collect after every frame (measures true need)\n"
-    "  --apu N             force the audio stand-in mode (0-3)\n");
+    "  --apu N             force the audio stand-in mode (0-3)\n"
+    "  --exact             device: turn the timing speed-ups off\n");
 }
 
 int main(int argc, char** argv) {
@@ -249,6 +254,7 @@ int main(int argc, char** argv) {
     else if(!strcmp(a, "--min-pool")) minPool = true;
     else if(!strcmp(a, "--collect-each")) collectEach = true;
     else if(!strcmp(a, "--apu")) apuMode = atoi(v), i++;
+    else if(!strcmp(a, "--exact")) g_exact = true;
     else {
       usage();
       return 2;

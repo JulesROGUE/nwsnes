@@ -35,7 +35,11 @@ void ppu_reset(Snes* s) {
   ppu->objSize = 0;
   memset(ppu->objBuf, 0, sizeof(ppu->objBuf));
   ppu->objBufDirty = false;
+  ppu->objMinX = NS_SCREEN_W;
+  ppu->objMaxX = 0;
   ppu->lutBrightness = 0xff;
+  ppu->objCount = 0;
+  ppu->objListDirty = true;
   ppu->timeOver = false;
   ppu->rangeOver = false;
   ppu->objInterlace = false;
@@ -278,6 +282,7 @@ void ppu_write(Snes* s, uint8_t adr, uint8_t val) {
       break;
     }
     case 0x01: {
+      ppu->objListDirty = true;
       ppu->objSize = val >> 5;
       ppu->objTileAdr1 = (val & 7) << 13;
       ppu->objTileAdr2 = ppu->objTileAdr1 + (((val & 0x18) + 8) << 9);
@@ -299,6 +304,7 @@ void ppu_write(Snes* s, uint8_t adr, uint8_t val) {
       break;
     }
     case 0x04: {
+      ppu->objListDirty = true;
       if(ppu->oamInHigh) {
         ppu->highOam[((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite] = val;
         if(ppu->oamSecondWrite) {
@@ -444,7 +450,10 @@ void ppu_write(Snes* s, uint8_t adr, uint8_t val) {
       if(!ppu->cgramSecondWrite) {
         ppu->cgramBuffer = val;
       } else {
-        ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
+        const uint16_t c = (uint16_t)((val << 8) | ppu->cgramBuffer);
+        ppu->pal565[ppu->cgramPointer] = (uint16_t)(
+          (ppu->lut5[c & 0x1f] << 11) | (ppu->lut6[(c >> 5) & 0x1f] << 5) | ppu->lut5[(c >> 10) & 0x1f]);
+        ppu->cgram[ppu->cgramPointer++] = c;
       }
       ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
       break;
@@ -544,6 +553,7 @@ void ppu_write(Snes* s, uint8_t adr, uint8_t val) {
       break;
     }
     case 0x33: {
+      ppu->objListDirty = true;
       ppu->interlace = val & 0x1;
       ppu->objInterlace = val & 0x2;
       ppu->overscan = val & 0x4;

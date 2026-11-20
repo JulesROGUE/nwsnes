@@ -28,6 +28,8 @@ void snes_init(Snes* s, uint8_t* pool, uint32_t poolBytes, NsPutLine putLine, vo
   s->putLine = putLine;
   s->user = user;
   s->renderFrame = true;
+  s->speedHacks = true;
+  s->codeBank = 0xffff;
   s->apu.forcedMode = 0xff;
 }
 
@@ -37,6 +39,7 @@ void snes_setRom(Snes* s, const uint8_t* rom, const NsRomInfo* info) {
   s->cart.romSize = info->romSize;
   s->cart.ramSize = info->ramSize > 0x8000 ? 0x8000 : info->ramSize;
   s->palTiming = info->pal;
+  s->codeBank = 0xffff;
 }
 
 void snes_reset(Snes* s, bool hard) {
@@ -72,6 +75,9 @@ void snes_reset(Snes* s, bool hard) {
   s->divideResult = 0x101;
   s->fastMem = false;
   s->openBus = 0;
+  s->codeBank = 0xffff;
+  s->writeCount = 0;
+  s->cpu.loopTarget = 0xffffffffu;
   s->frameReady = false;
   s->evIdx = 0;
   s->irqH = IRQ_NONE;
@@ -477,6 +483,7 @@ static void writeReg(Snes* s, uint16_t adr, uint8_t val) {
       break;
     case 0x420d:
       s->fastMem = val & 0x1;
+      s->codeBank = 0xffff; /* access time of the code bank may have changed */
       break;
     default:
       break;
@@ -559,6 +566,37 @@ static inline int accessTime(const Snes* s, uint32_t adr) {
   return (s->fastMem && bank >= 0x80) ? 6 : 8;
 }
 
+/* ----------------------------------------------------------- speed-ups -- */
+
+/* Opcode bytes are nearly always fetched from ROM at 8000-ffff of the current
+ * program bank. Remember where that bank sits in the ROM image so a fetch is
+ * one load instead of a full bus decode. */
+void snes_setCodeBank(Snes* s, uint32_t bank) {
+  const Cart* c = &s->cart;
+  s->codeBank = 0xffff;
+  if(bank == 0x7e || bank == 0x7f) return;
+  if(c->type == NS_CART_LOROM) {
+    s->codePtr = c->rom + (((bank & 0x7f) << 15) & (c->romSize - 1)) - 0x8000;
+  } else if(c->type == NS_CART_HIROM && c->romSize >= 0x10000) {
+    s->codePtr = c->rom + (((bank & 0x3f) << 16) & (c->romSize - 1));
+  } else if(c->type == NS_CART_EXHIROM && c->romSize >= 0x10000) {
+    s->codePtr = c->rom + ((((bank & 0x3f) << 16) | (bank < 0x80 ? 0x400000u : 0u)) & (c->romSize - 1));
+  } else {
+    return;
+  }
+  s->codeCycles = (s->fastMem && bank >= 0x80) ? 6 : 8;
+  s->codeBank = (uint16_t)bank;
+}
+
+/* The cpu is going round a loop that changes nothing: only an interrupt or
+ * a hardware flag can get it out, and those only change at scanline events
+ * (or when horizontal blanking starts). Jump there instead of spinning. */
+void snes_skipToEvent(Snes* s) {
+  uint32_t target = s->nextEvent;
+  if(s->hPos < 1096 && target > 1096) target = 1096;
+  if(target > s->hPos) snes_addCycles(s, (int)(target - s->hPos));
+}
+
 void snes_cpuIdle(Snes* s, bool waiting) {
   if(s->dma.dmaState) dma_handleDma(s, 6);
   int cycles = 6;
@@ -571,6 +609,16 @@ void snes_cpuIdle(Snes* s, bool waiting) {
 }
 
 uint8_t snes_cpuRead(Snes* s, uint32_t adr) {
+  if(!s->dma.dmaState) {
+    /* work ram, by far the most common data access */
+    uint32_t ra = 0xffffffffu;
+    if((adr >> 17) == 0x3f) ra = adr & 0x1ffff;                        /* 7e0000-7fffff */
+    else if(!(adr & 0xe000) && !(adr & 0x400000)) ra = adr & 0x1fff;   /* 0000-1fff of banks 00-3f, 80-bf */
+    if(ra != 0xffffffffu) {
+      snes_addCycles(s, 8);
+      return s->openBus = pager_read(&s->pager, NS_VP_WRAM + (ra >> NS_PAGE_SHIFT), ra & NS_PAGE_MASK);
+    }
+  }
   int cycles = accessTime(s, adr);
   if(s->dma.dmaState) dma_handleDma(s, cycles);
   snes_addCycles(s, cycles);
@@ -578,6 +626,18 @@ uint8_t snes_cpuRead(Snes* s, uint32_t adr) {
 }
 
 void snes_cpuWrite(Snes* s, uint32_t adr, uint8_t val) {
+  s->writeCount++;
+  if(!s->dma.dmaState) {
+    uint32_t ra = 0xffffffffu;
+    if((adr >> 17) == 0x3f) ra = adr & 0x1ffff;
+    else if(!(adr & 0xe000) && !(adr & 0x400000)) ra = adr & 0x1fff;
+    if(ra != 0xffffffffu) {
+      snes_addCycles(s, 8);
+      s->openBus = val;
+      pager_write(&s->pager, NS_VP_WRAM + (ra >> NS_PAGE_SHIFT), ra & NS_PAGE_MASK, val);
+      return;
+    }
+  }
   int cycles = accessTime(s, adr);
   if(s->dma.dmaState) dma_handleDma(s, cycles);
   snes_addCycles(s, cycles);

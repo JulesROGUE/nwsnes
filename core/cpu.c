@@ -127,7 +127,37 @@ static void cpu_checkInt(Cpu* cpu) {
 }
 
 static uint8_t cpu_readOpcode(Cpu* cpu) {
-  return cpu_read(cpu, (cpu->k << 16) | cpu->pc++);
+  Snes* s = (Snes*)cpu;
+  uint32_t pc = cpu->pc++;
+  if(pc >= 0x8000 && !s->dma.dmaState) {
+    if(cpu->k != s->codeBank) snes_setCodeBank(s, cpu->k);
+    if(cpu->k == s->codeBank) {
+      snes_addCycles(s, s->codeCycles);
+      return s->openBus = s->codePtr[pc];
+    }
+  }
+  return cpu_read(cpu, (cpu->k << 16) | pc);
+}
+
+// nwsnes speed-up 2: called when execution goes backwards (a loop). If the
+// cpu is at the same place, in the same state, and wrote nothing since last
+// time, the loop is only waiting: skip to the next thing that can end it.
+static void cpu_loopCheck(Cpu* cpu) {
+  Snes* s = (Snes*)cpu;
+  if(!s->speedHacks) return;
+  uint32_t target = (cpu->k << 16) | cpu->pc;
+  uint32_t sig0 = cpu->a | (cpu->x << 16);
+  uint32_t sig1 = cpu->y | (cpu->sp << 16);
+  uint32_t sig2 = cpu->dp | (cpu->db << 16) | (cpu_getFlags(cpu) << 24);
+  if(target == cpu->loopTarget && s->writeCount == cpu->loopWrites &&
+     sig0 == cpu->loopSig[0] && sig1 == cpu->loopSig[1] && sig2 == cpu->loopSig[2]) {
+    snes_skipToEvent(s);
+  }
+  cpu->loopTarget = target;
+  cpu->loopWrites = s->writeCount;
+  cpu->loopSig[0] = sig0;
+  cpu->loopSig[1] = sig1;
+  cpu->loopSig[2] = sig2;
 }
 
 static uint16_t cpu_readOpcodeWord(Cpu* cpu, bool intCheck) {
@@ -185,6 +215,7 @@ static void cpu_doBranch(Cpu* cpu, bool check) {
     cpu_checkInt(cpu);
     cpu_idle(cpu); // taken branch: 1 extra cycle
     cpu->pc += (int8_t) value;
+    if(value & 0x80) cpu_loopCheck(cpu);
   }
 }
 
@@ -1281,7 +1312,9 @@ static void cpu_doOpcode(Cpu* cpu, uint8_t opcode) {
       break;
     }
     case 0x4c: { // jmp abs
+      uint16_t from = cpu->pc;
       cpu->pc = cpu_readOpcodeWord(cpu, true);
+      if((uint16_t)(from - cpu->pc) < 0x100) cpu_loopCheck(cpu);
       break;
     }
     case 0x4d: { // eor abs

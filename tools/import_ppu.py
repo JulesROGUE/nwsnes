@@ -54,7 +54,7 @@ reset = func('ppu_reset')
 reset = reset.replace('void ppu_reset(Ppu* ppu) {', 'void ppu_reset(Snes* s) {\n  Ppu* ppu = &s->ppu;\n  /* video RAM is cleared by pager_reset() on a hard reset */')
 reset = reset.replace('  memset(ppu->vram, 0, sizeof(ppu->vram));\n', '')
 reset = reset.replace('  memset(ppu->objPixelBuffer, 0, sizeof(ppu->objPixelBuffer));\n  memset(ppu->objPriorityBuffer, 0, sizeof(ppu->objPriorityBuffer));\n',
-                      '  memset(ppu->objBuf, 0, sizeof(ppu->objBuf));\n  ppu->objBufDirty = false;\n  ppu->lutBrightness = 0xff;\n')
+                      '  memset(ppu->objBuf, 0, sizeof(ppu->objBuf));\n  ppu->objBufDirty = false;\n  ppu->objMinX = NS_SCREEN_W;\n  ppu->objMaxX = 0;\n  ppu->lutBrightness = 0xff;\n')
 reset = reset.replace('  memset(ppu->pixelBuffer, 0, sizeof(ppu->pixelBuffer));\n', '')
 assert 'vram' not in reset.replace('vramPointer','').replace('vramIncrement','').replace('vramRemap','').replace('vramRead','').replace('video RAM','')
 regs += reset + '\n'
@@ -88,6 +88,19 @@ wr = wr.replace('ppu->snes->', 's->')
 assert 'ppu->vram[' not in wr
 regs += wr
 regs = re.sub(r'      // fallthrough to normal layer BG-[HV]OFS\n    \}\n', '    }\n    /* fallthrough */\n', regs)
+# nwsnes: keep the RGB565 palette and the visible sprite list up to date
+old = '''        ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;'''
+new = '''        const uint16_t c = (uint16_t)((val << 8) | ppu->cgramBuffer);
+        ppu->pal565[ppu->cgramPointer] = (uint16_t)(
+          (ppu->lut5[c & 0x1f] << 11) | (ppu->lut6[(c >> 5) & 0x1f] << 5) | ppu->lut5[(c >> 10) & 0x1f]);
+        ppu->cgram[ppu->cgramPointer++] = c;'''
+assert old in regs
+regs = regs.replace(old, new)
+for case in ('    case 0x01: {\n', '    case 0x04: {\n', '    case 0x33: {\n'):
+    assert regs.count(case) >= 1, case
+    i = regs.rindex(case)   # the one in ppu_write (ppu_read comes first)
+    regs = regs[:i] + case + '      ppu->objListDirty = true;\n' + regs[i + len(case):]
+regs = regs.replace('  ppu->lutBrightness = 0xff;\n', '  ppu->lutBrightness = 0xff;\n  ppu->objCount = 0;\n  ppu->objListDirty = true;\n')
 regs = regs.replace('static uint16_t ppu_getVramRemap(Ppu* ppu) {', 'static uint16_t ppu_getVramRemap(const Ppu* ppu) {')
 open(out + '/ppu_regs.c', 'w').write(regs)
 
