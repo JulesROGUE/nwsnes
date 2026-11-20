@@ -52,7 +52,9 @@ Trois raccourcis, désactivables (`speedHacks`) :
 
 - les octets d'instruction sont lus par un pointeur direct dans la ROM tant que le programme reste dans la même banque ;
 - les accès à la mémoire de travail évitent le décodage complet du bus ;
-- **boucles d'attente** : quand le processeur revient en arrière au même endroit, avec exactement les mêmes registres et sans avoir rien écrit, il ne peut sortir de la boucle que par une interruption ou un drapeau matériel. On saute alors à la prochaine échéance. Sur la ROM de test, le coût du processeur émulé passe de 4,2 à 0,77 million d'instructions par image.
+- **boucles d'attente** : quand le processeur revient en arrière au même endroit, avec exactement les mêmes registres et sans avoir rien écrit, il ne peut sortir de la boucle que par une interruption ou un drapeau matériel. On saute alors à la prochaine échéance.
+
+Ensemble, ces trois raccourcis ont fait passer le coût du processeur émulé de 4,2 à 0,5 million d'instructions ARM par image sur le jeu de démonstration en mode 7 (600 premières images).
 
 Ce dernier raccourci déplace de quelques cycles le moment où une interruption arrive dans la boucle. Aucun pixel ne change sur 91 des 92 ROM de test ; les octets laissés sous le pointeur de pile par l'interruption peuvent différer, ce qui est sans effet.
 
