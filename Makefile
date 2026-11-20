@@ -2,6 +2,7 @@
 #
 #   make host      PC test harness (build/nwsnes-host), with the reference renderer
 #   make nwa       the calculator app (build/nwsnes.nwa), needs arm-none-eabi-gcc + node
+#   make probe     small app that shows the layout of the calculator's flash
 #   make sim       the calculator front end running on the PC (build/numworks-sim)
 #   make bench PACK=x  instructions per frame on an emulated Cortex-M7 (needs qemu-system-arm)
 #   make wasm      the core + profiler as WebAssembly, for the snes2nw PC tool (needs zig)
@@ -19,7 +20,7 @@ HOST_CC ?= cc
 HOST_CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter
 HOST_CFLAGS += -DNS_WITH_REFERENCE
 
-.PHONY: all host nwa nwa-check diag sim bench wasm testrom test clean
+.PHONY: all host nwa nwa-check diag probe sim bench wasm testrom test clean
 all: host
 
 host: $(BUILD)/nwsnes-host
@@ -69,6 +70,15 @@ $(BUILD)/nwsnes-diag.nwa: numworks/diag.c $(BUILD)/icon.o | $(BUILD)
 	  $(filter-out -flinker-output=nolto-rel -Wl$(comma)-T$(comma)numworks/app.ld,$(ARM_LDFLAGS)) numworks/diag.c $(BUILD)/diag_blob.S $(BUILD)/icon.o -o $@
 	$(NWLINK) nwa-elf $@ $(BUILD)/nwsnes-diag.elf
 	arm-none-eabi-size -A $(BUILD)/nwsnes-diag.elf | grep -E "\.text|\.rodata |\.data|\.bss"
+
+# ---- probe app: shows how the calculator's flash is laid out (see numworks/probe.c) ---
+probe: $(BUILD)/nwsnes-probe.nwa
+
+$(BUILD)/nwsnes-probe.nwa: numworks/probe.c $(BUILD)/icon.o | $(BUILD)
+	$(ARM_CC) -std=c11 -Os -Wall -Wextra $(shell $(NWLINK) eadk-cflags-device) -fdata-sections -ffunction-sections \
+	  $(filter-out -flinker-output=nolto-rel -Wl$(comma)-T$(comma)numworks/app.ld,$(ARM_LDFLAGS)) numworks/probe.c $(BUILD)/icon.o -o $@
+	$(NWLINK) nwa-elf $@ $(BUILD)/nwsnes-probe.elf
+	arm-none-eabi-size -A $(BUILD)/nwsnes-probe.elf | grep -E "\.text|\.rodata |\.data|\.bss"
 
 # links the app the way the installer does (with an empty game), to check
 # that it links and to see how much RAM its own data takes
