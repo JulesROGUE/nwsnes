@@ -121,7 +121,11 @@ static Session* sessionNew(const NsPack* pack, uint32_t poolPages, bool refPpu) 
   se->pool = malloc(se->poolBytes ? se->poolBytes : 1);
   snes_init(&se->snes, se->pool, se->poolBytes, putRows, se);
   se->snes.romTrace = g_romTrace;
-  if(!pack_attach(pack, &se->snes)) fprintf(stderr, "warning: not enough RAM for the table of ROM blocks\n");
+  if(!pack_attach(pack, &se->snes)) {
+    fprintf(stderr, pack->extSize && !pack->ext ? "this pack comes in two parts and the second one (its extension) is missing or damaged\n"
+                                                : "not enough RAM for the table of ROM blocks\n");
+    exit(1);
+  }
   se->snes.refPpu = refPpu;
   se->snes.refCpu = refPpu; /* the reference session: LakeSnes' interpreter and renderer */
   /* ...and it never uses speed-ups */
@@ -189,6 +193,7 @@ static void usage(void) {
     "  --hash-each         print a hash of every frame\n"
     "  --profile OUT       profile the game and write a pack to OUT\n"
     "  --budget-kb N       flash budget of that pack (default 2304)\n"
+    "  --ext-kb N          room in the other half of the flash for an extension of the pack (default 0: none)\n"
     "  --min-pool          find the smallest RAM pool that completes the run\n"
     "  --collect-each      device: collect after every frame (measures true need)\n"
     "  --apu N             force the audio stand-in mode (0-3)\n"
@@ -201,7 +206,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   const char* path = argv[1];
-  uint32_t frames = 600, seed = 0, poolKb = 0, dumpEvery = 60, budgetKb = 2304;
+  uint32_t frames = 600, seed = 0, poolKb = 0, dumpEvery = 60, budgetKb = 2304, extKb = 0;
   const char *inputPath = NULL, *dumpDir = NULL, *profileOut = NULL;
   bool ref = false, compare = false, hash = false, minPool = false, collectEach = false, hashEach = false;
   int apuMode = -1;
@@ -220,6 +225,7 @@ int main(int argc, char** argv) {
     else if(!strcmp(a, "--hash-each")) hashEach = true;
     else if(!strcmp(a, "--profile")) profileOut = v, i++;
     else if(!strcmp(a, "--budget-kb")) budgetKb = (uint32_t)strtoul(v, NULL, 0), i++;
+    else if(!strcmp(a, "--ext-kb")) extKb = (uint32_t)strtoul(v, NULL, 0), i++;
     else if(!strcmp(a, "--min-pool")) minPool = true;
     else if(!strcmp(a, "--collect-each")) collectEach = true;
     else if(!strcmp(a, "--apu")) apuMode = atoi(v), i++;
@@ -309,6 +315,7 @@ int main(int argc, char** argv) {
       prof_sample(prof, &se->snes);
     }
     params.maxPackBytes = budgetKb * 1024;
+    params.maxExtBytes = extKb * 1024;
     uint32_t size = 0;
     NsPackStats st;
     uint8_t* out = prof_buildPack(prof, &params, &size, &st);
@@ -319,6 +326,10 @@ int main(int argc, char** argv) {
     printf("profile: %u frames, %u stable page contents (%u dropped)\n", st.framesSampled, st.candidates, st.dropped);
     printf("pack: %u bytes, dictionary %u pages (%u found in the ROM, %u stored, %u left out)\n",
            st.packBytes, st.dictEntries, st.dictInRom, st.dictStored, st.dictLeftOut);
+    if(st.extBytes) {
+      printf("pack: %u bytes in the pack itself, %u bytes (%u KB of ROM) in its extension for the other half of the flash\n",
+             st.mainBytes, st.extBytes, st.romBlocksInExt * 4);
+    }
     if(st.romBlocksPacked < st.romBlocks) {
       printf("pack: the ROM does not fit: %u KB of its %u KB are in the pack (%u KB read during the session)\n",
              st.romBlocksPacked * 4, st.romBlocks * 4, st.romBlocksRead * 4);

@@ -25,7 +25,11 @@ typedef struct NsPackParams {
   uint8_t apuMode;       /* 0xff: automatic */
   uint8_t frameSkip;     /* 0xff: automatic */
   const char* title;
-  uint32_t maxPackBytes; /* flash budget for the whole pack */
+  uint32_t maxPackBytes; /* flash budget for the pack (the app area of the running half) */
+  /* Room in the app area of the other half of the flash, where the ROM
+   * blocks that do not fit in the pack can go (the "extension", see
+   * core/pack.h), or 0 not to use it. */
+  uint32_t maxExtBytes;
   /* One byte per 256-byte page of the ROM, non-zero when the game read it
    * (Snes.romTrace), or NULL. When the whole ROM does not fit in the budget,
    * this decides which 4 KB blocks of it go in the pack. */
@@ -43,7 +47,10 @@ typedef struct NsPackStats {
   uint32_t packBytes;
   uint32_t romBlocks;      /* 4 KB blocks in the ROM */
   uint32_t romBlocksRead;  /* blocks the game was seen to read */
-  uint32_t romBlocksPacked;/* blocks in the pack (all of them when the ROM fits) */
+  uint32_t romBlocksPacked;/* blocks in the pack and its extension (all of them when the ROM fits) */
+  uint32_t romBlocksInExt; /* of which in the extension */
+  uint32_t mainBytes;      /* the pack itself: the first mainBytes bytes of what is returned... */
+  uint32_t extBytes;       /* ...and the extension that follows it (0: none) */
 } NsPackStats;
 
 NsProfiler* prof_new(void);
@@ -56,7 +63,8 @@ void prof_sample(NsProfiler* p, const Snes* s);
 /* marks in romUsed (one byte per 256-byte page) the parts of the ROM an
  * existing pack holds, so that rebuilding it does not lose them */
 void prof_seedRomUse(const uint8_t* packData, uint32_t packSize, uint8_t* romUsed, uint32_t romSize);
-/* returns a malloc'ed pack (NULL on failure); stats may be NULL */
+/* returns a malloc'ed pack (NULL on failure), followed by its extension if it
+ * has one; *outSize covers both. stats may be NULL */
 uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_t* outSize, NsPackStats* stats);
 /* pads/mirrors a ROM image to a power of two; returns a malloc'ed copy */
 uint8_t* ns_padRom(const uint8_t* data, uint32_t length, uint32_t* outSize);

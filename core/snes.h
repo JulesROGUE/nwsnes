@@ -430,11 +430,12 @@ typedef struct NsRomInfo {
 /* The caller provides the RAM pool. Nothing is allocated by the core. */
 void snes_init(Snes* s, uint8_t* pool, uint32_t poolBytes, NsPutRows putRows, void* user);
 /* The ROM in one piece (rom), or as a table of 4 KB blocks: romSize / 4096
- * little-endian u32, each the offset of a block from base, or 0xffffffff for
- * a block that is not there. The table of pointers is taken from the pool.
- * Returns false when there is not enough RAM for it. */
+ * little-endian u32, each the offset of a block from base (or from ext when
+ * bit 31 is set), or 0xffffffff for a block that is not there. The table of
+ * pointers is taken from the pool. Returns false when there is not enough
+ * RAM for it. */
 bool snes_setRom(Snes* s, const uint8_t* rom, const NsRomInfo* info);
-bool snes_setRomBlocks(Snes* s, const uint8_t* base, const uint8_t* table, const NsRomInfo* info);
+bool snes_setRomBlocks(Snes* s, const uint8_t* base, const uint8_t* ext, const uint8_t* table, const NsRomInfo* info);
 void snes_reset(Snes* s, bool hard);
 void snes_runFrame(Snes* s);
 static inline void snes_setPad(Snes* s, int player, uint16_t buttons) { s->pad[player & 1] = buttons; }

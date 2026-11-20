@@ -85,11 +85,13 @@ bool snes_setRom(Snes* s, const uint8_t* rom, const NsRomInfo* info) {
   return true;
 }
 
-bool snes_setRomBlocks(Snes* s, const uint8_t* base, const uint8_t* table, const NsRomInfo* info) {
+bool snes_setRomBlocks(Snes* s, const uint8_t* base, const uint8_t* ext, const uint8_t* table, const NsRomInfo* info) {
   if(!setCart(s, info)) return false;
   for(uint32_t i = 0; i < info->romSize >> NS_ROM_BLOCK_SHIFT; i++) {
     const uint32_t off = ns_rd32(table + i * 4);
-    s->cart.block[i] = off == 0xffffffffu ? NULL : base + off;
+    if(off == 0xffffffffu) s->cart.block[i] = NULL;
+    else if(off & 0x80000000u) s->cart.block[i] = ext ? ext + (off & 0x7fffffffu) : NULL;
+    else s->cart.block[i] = base + off;
   }
   mapRom(s);
   return true;

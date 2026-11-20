@@ -118,7 +118,8 @@ void prof_seed(NsProfiler* p, const uint8_t* packData, uint32_t packSize) {
   if(!pack_open(packData, packSize, &pack)) return;
   for(uint32_t i = 0; i < pack.dictCount; i++) {
     const uint8_t* e = pack.dict + i * NS_DICT_ENTRY_SIZE;
-    const uint8_t* content = pack.base + ns_rd32(e + 4);
+    const uint8_t* content = pack_dictPage(&pack, ns_rd32(e + 4));
+    if(!content) continue; /* in an extension that did not come with the file */
     int32_t idx = intern(p, ns_rd32(e), content);
     /* earlier sessions vouched for it: make sure it outranks one-off pages */
     if(idx >= 0 && p->entries[idx].weight < 1000) p->entries[idx].weight = 1000;
@@ -197,6 +198,7 @@ static int byWeightDesc(const void* a, const void* b) {
 typedef struct DictOut {
   uint32_t hash;
   uint32_t offset;
+  bool isStored; /* a page of its own in the pack, as opposed to a place in the ROM */
 } DictOut;
 
 static int byHash(const void* a, const void* b) {
@@ -263,27 +265,35 @@ void prof_seedRomUse(const uint8_t* packData, uint32_t packSize, uint8_t* romUse
 }
 
 /* picks the dictionary entries that fit: best contents first, until the
- * flash budget is used up. Returns the bytes used, fixed part included. */
-static uint32_t pickDict(const NsProfiler* p, uint32_t count, const uint32_t* order, const uint32_t* romPos, uint32_t romOff,
-                         uint32_t fixed, uint32_t maxPackBytes, DictOut* dict, uint32_t* stored, uint32_t* nDictOut,
-                         uint32_t* nStoredOut, NsPackStats* st) {
+ * flash budget is used up. A content found as is in the ROM blocks of the
+ * pack (mainPos) or of its extension (extPos) costs its entry only. Returns
+ * the bytes used, fixed part included. */
+static uint32_t pickDict(const NsProfiler* p, uint32_t count, const uint32_t* order, const uint32_t* mainPos,
+                         const uint32_t* extPos, uint32_t romOff, uint32_t fixed, uint32_t maxPackBytes, DictOut* dict,
+                         uint32_t* stored, uint32_t* nDictOut, uint32_t* nStoredOut, NsPackStats* st) {
   uint32_t nDict = 0, nStored = 0, used = fixed;
   st->dictInRom = 0;
   st->dictLeftOut = 0;
   for(uint32_t i = 0; i < count; i++) {
     uint32_t idx = order[i];
-    uint32_t cost = NS_DICT_ENTRY_SIZE + (romPos[idx] == 0xffffffffu ? NS_PAGE_SIZE : 0);
+    const bool inRom = mainPos[idx] != 0xffffffffu || extPos[idx] != 0xffffffffu;
+    uint32_t cost = NS_DICT_ENTRY_SIZE + (inRom ? 0 : NS_PAGE_SIZE);
     if(maxPackBytes && used + cost > maxPackBytes) {
       st->dictLeftOut++;
       continue;
     }
     used += cost;
     dict[nDict].hash = p->entries[idx].hash;
-    if(romPos[idx] != 0xffffffffu) {
-      dict[nDict].offset = romOff + romPos[idx];
+    dict[nDict].isStored = false;
+    if(mainPos[idx] != 0xffffffffu) {
+      dict[nDict].offset = romOff + mainPos[idx];
+      st->dictInRom++;
+    } else if(extPos[idx] != 0xffffffffu) {
+      dict[nDict].offset = NS_PACK_IN_EXT | (NS_PACK_EXT_HEADER_SIZE + extPos[idx]);
       st->dictInRom++;
     } else {
-      dict[nDict].offset = 0x80000000u | nStored; /* patched by the caller */
+      dict[nDict].offset = nStored; /* its rank among the stored pages: turned into an offset by the caller */
+      dict[nDict].isStored = true;
       stored[nStored++] = idx;
     }
     nDict++;
@@ -291,6 +301,63 @@ static uint32_t pickDict(const NsProfiler* p, uint32_t count, const uint32_t* or
   *nDictOut = nDict;
   *nStoredOut = nStored;
   return used;
+}
+
+/* marks the blocks nearest to the ones already taken, as many as "extra" */
+static void takeNeighbours(uint8_t* present, uint32_t nBlocks, uint32_t extra) {
+  uint32_t* dist = malloc(nBlocks * sizeof(uint32_t));
+  if(!dist) return;
+  uint32_t d = 0xffffffffu;
+  for(uint32_t i = 0; i < nBlocks; i++) {
+    d = present[i] ? 0 : (d == 0xffffffffu ? d : d + 1);
+    dist[i] = d;
+  }
+  d = 0xffffffffu;
+  for(uint32_t i = nBlocks; i-- > 0;) {
+    d = present[i] ? 0 : (d == 0xffffffffu ? d : d + 1);
+    if(d < dist[i]) dist[i] = d;
+  }
+  for(uint32_t want = 1; extra > 0 && want < nBlocks; want++) {
+    for(uint32_t i = 0; i < nBlocks && extra > 0; i++) {
+      if(dist[i] == want) {
+        present[i] = 1;
+        extra--;
+      }
+    }
+  }
+  free(dist);
+}
+
+/* A block is stored once, however many times its content appears in the ROM
+ * (a 3 MB ROM comes mirrored to 4 MB, and games have a few empty blocks):
+ * first[i] is the first block with the content of block i. Returns the
+ * number of distinct contents. */
+static uint32_t findTwins(const uint8_t* rom, uint32_t nBlocks, uint32_t* first) {
+  uint32_t* hash = malloc((nBlocks + 1) * sizeof(uint32_t));
+  uint32_t distinct = 0;
+  for(uint32_t i = 0; i < nBlocks; i++) {
+    const uint8_t* b = rom + ((size_t)i << NS_ROM_BLOCK_SHIFT);
+    const uint32_t h = ns_hashBytes(b, NS_ROM_BLOCK);
+    if(hash) hash[i] = h;
+    first[i] = i;
+    for(uint32_t j = 0; hash && j < i; j++) {
+      if(hash[j] == h && first[j] == j && memcmp(rom + ((size_t)j << NS_ROM_BLOCK_SHIFT), b, NS_ROM_BLOCK) == 0) {
+        first[i] = j;
+        break;
+      }
+    }
+    distinct += first[i] == i;
+  }
+  free(hash);
+  return distinct;
+}
+
+/* a content that is in the pack serves all the blocks that have it */
+static void spreadToTwins(uint8_t* present, const uint32_t* first, uint32_t nBlocks) {
+  for(uint32_t i = 0; i < nBlocks; i++) {
+    if(present[i]) present[first[i]] = 1;
+  }
+  for(uint32_t i = 0; i < nBlocks; i++) present[i] = present[first[i]];
 }
 
 uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_t* outSize, NsPackStats* stats) {
@@ -301,11 +368,22 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
   st.dropped = p ? p->dropped : 0;
   uint32_t count = p ? p->count : 0;
 
-  /* The ROM goes in whole when it fits. Otherwise, and if it is known what
-   * the game reads, only those 4 KB blocks go in (version 2 of the format). */
+  /* Three layouts, by decreasing comfort:
+   *  - the ROM fits in the pack: it goes in whole, in one piece (version 1);
+   *  - it fits with the help of the extension (the app area of the other
+   *    half of the flash): it goes in whole, as 4 KB blocks. The extension
+   *    takes all the blocks it can, starting from the end of the ROM: what
+   *    it holds then depends on the ROM alone, not on how the game was
+   *    played, and a pack rebuilt after more play goes with the extension
+   *    already on the calculator;
+   *  - it does not fit at all: only the blocks the game was seen to read go
+   *    in, plus their neighbours as far as room allows. */
   const uint32_t nBlocks = params->romSize >> NS_ROM_BLOCK_SHIFT;
-  const bool blocks = params->maxPackBytes && params->romUsed && NS_PACK_HEADER_SIZE + params->romSize > params->maxPackBytes;
-  const uint32_t headerSize = blocks ? NS_PACK_HEADER_SIZE_BLOCKS : NS_PACK_HEADER_SIZE;
+  const bool blocks = params->maxPackBytes && NS_PACK_HEADER_SIZE + params->romSize > params->maxPackBytes &&
+                      (params->romUsed || params->maxExtBytes);
+  const uint32_t extRoom = blocks && params->maxExtBytes > NS_PACK_EXT_HEADER_SIZE
+                               ? (params->maxExtBytes - NS_PACK_EXT_HEADER_SIZE) >> NS_ROM_BLOCK_SHIFT : 0;
+  const uint32_t headerSize = !blocks ? NS_PACK_HEADER_SIZE : (extRoom ? NS_PACK_HEADER_SIZE_EXT : NS_PACK_HEADER_SIZE_BLOCKS);
   const uint32_t tableOff = headerSize;
   const uint32_t romOff = headerSize + (blocks ? nBlocks * 4 : 0);
   st.romBlocks = nBlocks;
@@ -313,22 +391,44 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
   st.romBlocksPacked = nBlocks;
 
   uint32_t* order = malloc((count + 1) * sizeof(uint32_t));
-  uint32_t* romPos = malloc((count + 1) * sizeof(uint32_t));
+  uint32_t* mainPos = malloc((count + 1) * sizeof(uint32_t));
+  uint32_t* extPos = malloc((count + 1) * sizeof(uint32_t));
   DictOut* dict = malloc((count + 1) * sizeof(DictOut));
   uint32_t* stored = malloc((count + 1) * sizeof(uint32_t)); /* entries needing their own flash page */
-  uint8_t* present = calloc(nBlocks + 1, 1);                  /* blocks that go in the pack */
-  uint8_t* image = blocks ? malloc(params->romSize) : NULL;   /* those blocks one after the other */
-  if(!order || !romPos || !dict || !stored || !present || (blocks && !image)) {
-    free(order); free(romPos); free(dict); free(stored); free(present); free(image);
+  uint8_t* present = calloc(nBlocks + 1, 1);                  /* blocks that go in the pack or its extension */
+  uint8_t* inExt = calloc(nBlocks + 1, 1);                    /* ...of which in the extension */
+  uint8_t* wasRead = calloc(nBlocks + 1, 1);
+  uint32_t* first = malloc((nBlocks + 1) * sizeof(uint32_t)); /* the block whose content block i shares */
+  uint32_t* where = malloc((nBlocks + 1) * sizeof(uint32_t)); /* block table */
+  uint8_t* image = blocks ? malloc(params->romSize) : NULL;    /* the blocks of the pack one after the other */
+  uint8_t* extImage = blocks ? malloc(params->romSize) : NULL; /* the same for the extension */
+#define FREE_ALL() \
+  do { \
+    free(order); free(mainPos); free(extPos); free(dict); free(stored); free(present); free(inExt); free(wasRead); \
+    free(first); free(where); free(image); free(extImage); \
+  } while(0)
+  if(!order || !mainPos || !extPos || !dict || !stored || !present || !inExt || !wasRead || !first || !where ||
+     (blocks && (!image || !extImage))) {
+    FREE_ALL();
     return NULL;
   }
+  bool whole = true;
   if(blocks) {
     st.romBlocksRead = 0;
     for(uint32_t i = 0; i < nBlocks; i++) {
-      for(uint32_t j = 0; j < NS_ROM_BLOCK / NS_PAGE_SIZE; j++) present[i] |= params->romUsed[i * (NS_ROM_BLOCK / NS_PAGE_SIZE) + j];
-      present[i] = present[i] != 0;
-      st.romBlocksRead += present[i];
+      if(params->romUsed) {
+        for(uint32_t j = 0; j < NS_ROM_BLOCK / NS_PAGE_SIZE; j++) wasRead[i] |= params->romUsed[i * (NS_ROM_BLOCK / NS_PAGE_SIZE) + j];
+      }
+      wasRead[i] = wasRead[i] != 0;
+      st.romBlocksRead += wasRead[i];
     }
+    /* whole ROM: what the extension cannot take must fit in the pack */
+    const uint32_t distinct = findTwins(params->rom, nBlocks, first);
+    const uint32_t inMain = distinct > extRoom ? distinct - extRoom : 0;
+    whole = romOff + (uint64_t)inMain * NS_ROM_BLOCK <= params->maxPackBytes;
+    if(!whole && !params->romUsed) whole = true; /* nothing known about what is read: all of it, too big or not */
+    for(uint32_t i = 0; i < nBlocks; i++) present[i] = whole || wasRead[i];
+    spreadToTwins(present, first, nBlocks);
   } else {
     memset(present, 1, nBlocks);
   }
@@ -338,67 +438,71 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
     qsort(order, count, sizeof(uint32_t), byWeightDesc);
   }
 
-  uint32_t nDict = 0, nStored = 0, imageSize = 0;
+  uint32_t nDict = 0, nStored = 0, imageSize = 0, extBlocks = 0;
   const uint8_t* romData = params->rom;
   for(int pass = 0; pass < (blocks ? 2 : 1); pass++) {
+    for(uint32_t i = 0; i < count; i++) mainPos[i] = extPos[i] = 0xffffffffu;
     if(blocks) {
+      /* the extension takes the last blocks, as many as it can hold */
+      uint32_t toStore = 0;
+      for(uint32_t i = 0; i < nBlocks; i++) toStore += present[i] && first[i] == i;
+      extBlocks = toStore < extRoom ? toStore : extRoom;
+      memset(inExt, 0, nBlocks);
+      for(uint32_t i = nBlocks, left = extBlocks; i-- > 0 && left > 0;) {
+        if(present[i] && first[i] == i) {
+          inExt[i] = 1;
+          left--;
+        }
+      }
       imageSize = 0;
+      uint32_t extImageSize = 0;
       for(uint32_t i = 0; i < nBlocks; i++) {
-        if(!present[i]) continue;
-        memcpy(image + imageSize, params->rom + ((size_t)i << NS_ROM_BLOCK_SHIFT), NS_ROM_BLOCK);
-        imageSize += NS_ROM_BLOCK;
+        if(!present[i] || first[i] != i) continue;
+        const uint8_t* b = params->rom + ((size_t)i << NS_ROM_BLOCK_SHIFT);
+        if(inExt[i]) {
+          memcpy(extImage + extImageSize, b, NS_ROM_BLOCK);
+          extImageSize += NS_ROM_BLOCK;
+        } else {
+          memcpy(image + imageSize, b, NS_ROM_BLOCK);
+          imageSize += NS_ROM_BLOCK;
+        }
       }
       romData = image;
+      if(count && extImageSize >= NS_PAGE_SIZE) findInRom(p, extImage, extImageSize, extPos);
     } else {
       imageSize = params->romSize;
     }
-    for(uint32_t i = 0; i < count; i++) romPos[i] = 0xffffffffu;
-    if(count && imageSize >= NS_PAGE_SIZE) findInRom(p, romData, imageSize, romPos);
-    const uint32_t used = pickDict(p, count, order, romPos, romOff, romOff + imageSize, params->maxPackBytes, dict, stored,
-                                   &nDict, &nStored, &st);
-    if(!blocks || pass == 1) break;
-    /* Room left once everything known is in: use it for the blocks next to
-     * the ones the game read. A game played on the calculator never does
-     * exactly what it did on the PC, and what it reads instead is usually
-     * close by (another frame of an animation, the next entry of a table). */
-    uint32_t extra = used < params->maxPackBytes ? (params->maxPackBytes - used) / NS_ROM_BLOCK : 0;
+    if(count && imageSize >= NS_PAGE_SIZE) findInRom(p, romData, imageSize, mainPos);
+    const uint32_t used = pickDict(p, count, order, mainPos, extPos, romOff, romOff + imageSize, params->maxPackBytes, dict,
+                                   stored, &nDict, &nStored, &st);
+    if(!blocks || whole || pass == 1) break;
+    /* Part of the ROM only, and room left once everything known is in: use
+     * it for the blocks next to the ones the game read. A game played on the
+     * calculator never does exactly what it did on the PC, and what it reads
+     * instead is usually close by (another frame of an animation, the next
+     * entry of a table). */
+    uint32_t extra = extRoom - extBlocks;
+    if(used < params->maxPackBytes) extra += (params->maxPackBytes - used) / NS_ROM_BLOCK;
     if(extra == 0 || st.romBlocksRead == 0) break;
-    uint32_t* dist = malloc(nBlocks * sizeof(uint32_t));
-    if(!dist) break;
-    uint32_t d = 0xffffffffu;
-    for(uint32_t i = 0; i < nBlocks; i++) {
-      d = present[i] ? 0 : (d == 0xffffffffu ? d : d + 1);
-      dist[i] = d;
-    }
-    d = 0xffffffffu;
-    for(uint32_t i = nBlocks; i-- > 0;) {
-      d = present[i] ? 0 : (d == 0xffffffffu ? d : d + 1);
-      if(d < dist[i]) dist[i] = d;
-    }
-    for(uint32_t want = 1; extra > 0 && want < nBlocks; want++) {
-      for(uint32_t i = 0; i < nBlocks && extra > 0; i++) {
-        if(dist[i] == want) {
-          present[i] = 1;
-          extra--;
-        }
-      }
-    }
-    free(dist);
+    takeNeighbours(present, nBlocks, extra);
+    spreadToTwins(present, first, nBlocks);
   }
   st.romBlocksPacked = 0;
   for(uint32_t i = 0; i < nBlocks; i++) st.romBlocksPacked += present[i];
+  st.romBlocksInExt = extBlocks;
 
   const uint32_t fixed = romOff + imageSize;
   uint32_t dictOff = fixed;
   uint32_t dataOff = dictOff + nDict * NS_DICT_ENTRY_SIZE;
   uint32_t total = dataOff + nStored * NS_PAGE_SIZE;
-  uint8_t* pack = calloc(1, total);
+  const uint32_t extSize = extBlocks ? NS_PACK_EXT_HEADER_SIZE + extBlocks * NS_ROM_BLOCK : 0;
+  uint8_t* pack = calloc(1, (size_t)total + extSize);
   if(!pack) {
-    free(order); free(romPos); free(dict); free(stored); free(present); free(image);
+    FREE_ALL();
     return NULL;
   }
   for(uint32_t i = 0; i < nDict; i++) {
-    if(dict[i].offset & 0x80000000u) dict[i].offset = dataOff + (dict[i].offset & 0x7fffffffu) * NS_PAGE_SIZE;
+    if(dict[i].isStored) dict[i].offset = dataOff + dict[i].offset * NS_PAGE_SIZE;
   }
   qsort(dict, nDict, sizeof(DictOut), byHash);
 
@@ -420,17 +524,42 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
     size_t n = strlen(params->title);
     memcpy(pack + 48, params->title, n > 16 ? 16 : n);
   }
+  memcpy(pack + romOff, romData, imageSize);
   if(blocks) {
     wr32(pack + 64, tableOff);
     wr32(pack + 68, nBlocks);
     wr32(pack + 72, st.romBlocksPacked);
-    uint32_t off = romOff;
+    wr32(pack + 76, extSize);
+    uint8_t* ext = pack + total;
+    uint32_t off = romOff, extOff = NS_PACK_EXT_HEADER_SIZE;
     for(uint32_t i = 0; i < nBlocks; i++) {
-      wr32(pack + tableOff + i * 4, present[i] ? off : 0xffffffffu);
-      if(present[i]) off += NS_ROM_BLOCK;
+      if(!present[i]) {
+        where[i] = 0xffffffffu;
+      } else if(first[i] != i) {
+        where[i] = where[first[i]]; /* first[i] < i: already placed */
+      } else if(inExt[i]) {
+        where[i] = NS_PACK_IN_EXT | extOff;
+        memcpy(ext + extOff, params->rom + ((size_t)i << NS_ROM_BLOCK_SHIFT), NS_ROM_BLOCK);
+        extOff += NS_ROM_BLOCK;
+      } else {
+        where[i] = off;
+        off += NS_ROM_BLOCK;
+      }
+      wr32(pack + tableOff + i * 4, where[i]);
+    }
+    if(extSize) {
+      /* The identifier is derived from what the extension holds, and from
+       * nothing else: any pack that wants these blocks in this order goes
+       * with it. */
+      const uint32_t hash = ns_hashBytes(ext + NS_PACK_EXT_HEADER_SIZE, extSize - NS_PACK_EXT_HEADER_SIZE);
+      const uint32_t id = hash ^ 0x4e575358u;
+      memcpy(ext, NS_PACK_EXT_MAGIC, 8);
+      wr32(ext + 8, extSize);
+      wr32(ext + 12, id);
+      wr32(pack + 80, id);
+      wr32(pack + 84, hash);
     }
   }
-  memcpy(pack + romOff, romData, imageSize);
   for(uint32_t i = 0; i < nDict; i++) {
     wr32(pack + dictOff + i * NS_DICT_ENTRY_SIZE, dict[i].hash);
     wr32(pack + dictOff + i * NS_DICT_ENTRY_SIZE + 4, dict[i].offset);
@@ -440,9 +569,12 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
   }
   st.dictEntries = nDict;
   st.dictStored = nStored;
-  st.packBytes = total;
+  st.packBytes = total + extSize;
+  st.mainBytes = total;
+  st.extBytes = extSize;
   if(stats) *stats = st;
-  *outSize = total;
-  free(order); free(romPos); free(dict); free(stored); free(present); free(image);
+  *outSize = total + extSize;
+  FREE_ALL();
+#undef FREE_ALL
   return pack;
 }

@@ -151,6 +151,34 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+#ifndef NS_SIM
+  if(pack.extSize && !pack.ext) {
+    /* every byte of the extension is checked: a system update, or another
+     * game installed since, may have overwritten it */
+    text(0, "nwsnes");
+    text(2, "Verification du jeu...");
+    const uint32_t here = (uint32_t)(uintptr_t)eadk_app_name;
+    const uint32_t half = pack_flashHalf(here), other = pack_otherFlashHalf(here);
+    const uint32_t place = half ? pack_extensionAddress(here, (const uint8_t*)(uintptr_t)(half + NS_FLASH_INFO_OFFSET),
+                                                        (const uint8_t*)(uintptr_t)(other + NS_FLASH_INFO_OFFSET), pack.extSize)
+                                : 0;
+    if(place) pack_setExtension(&pack, (const uint8_t*)(uintptr_t)place, true);
+    eadk_display_push_rect_uniform(eadk_screen_rect, eadk_color_black);
+  }
+#endif
+  if(pack.extSize && !pack.ext) {
+    text(0, "nwsnes");
+    text(2, "Jeu incomplet.");
+    text(3, "Ce jeu est en deux morceaux,");
+    text(4, "et celui range dans l'autre");
+    text(5, "moitie de la memoire flash est");
+    text(6, "absent ou abime (mise a jour");
+    text(7, "de la calculatrice ?).");
+    text(9, "Reinstallez-le avec snes2nw.");
+    waitKey();
+    return 0;
+  }
+
   snes_init(&snes, pool, poolBytes, putRows, NULL);
   if(!pack_attach(&pack, &snes)) {
     text(0, "nwsnes");
@@ -163,7 +191,7 @@ int main(int argc, char* argv[]) {
 
   /* start screen. It stays up until a key is pressed so the RAM figure can
    * be read: it is the number snes2nw needs (--ram-kb) to give a verdict. */
-  text(0, "nwsnes 0.2");
+  text(0, "nwsnes 0.3");
   text(1, pack.title);
   char* p = putStr(buf, "RAM totale: ");
   p = putNum(p, (uint32_t)((uintptr_t)HEAP_END - (uintptr_t)RAM_START) / 1024);
@@ -178,27 +206,19 @@ int main(int argc, char* argv[]) {
   putStr(p, " pages");
   text(5, buf);
   if(pack.blockTable) {
-    /* a game too big for the flash: only the part played on the PC is here */
+    /* a game too big for the app area: how much of its ROM is installed */
     p = putStr(buf, "ROM: ");
     p = putNum(p, pack.blocksPresent * 4);
     p = putStr(p, " Ko sur ");
     p = putNum(p, pack.info.romSize / 1024);
     text(6, buf);
   }
-#ifndef NS_SIM
-  {
-    /* Room for external apps, deduced from where this app sits: apps start on
-     * a 64 KB boundary and (assumption) their area runs to the end of the
-     * 4 MB slot the system is in. Shown so that it can be checked against
-     * what snes2nw assumes (--flash-kb). */
-    const uintptr_t appStart = (uintptr_t)eadk_app_name & ~(uintptr_t)0xffff;
-    const uintptr_t slotEnd = (appStart | 0x3fffff) + 1;
-    p = putStr(buf, "Flash (estim.): ");
-    p = putNum(p, (uint32_t)(slotEnd - appStart) / 1024);
-    putStr(p, " Ko");
-    text(pack.blockTable ? 7 : 6, buf);
+  if(pack.ext) {
+    p = putStr(buf, "dont ");
+    p = putNum(p, (pack.extSize - NS_PACK_EXT_HEADER_SIZE) / 1024);
+    putStr(p, " Ko dans la 2e moitie");
+    text(7, buf);
   }
-#endif
   text(8, "0: stats   Maison: quitter");
   text(10, "Appuyez sur OK");
   waitKey();

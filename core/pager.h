@@ -39,7 +39,9 @@
 
 /* A dictionary entry is 8 bytes, little endian, possibly unaligned in flash:
  *   u32 hash    ns_pageHash() of the page content
- *   u32 offset  byte offset of the 256-byte content inside the pack */
+ *   u32 offset  byte offset of the 256-byte content inside the pack or,
+ *               with bit 31 set, inside the pack's extension */
+#define NS_DICT_IN_EXT 0x80000000u
 #define NS_DICT_ENTRY_SIZE 8u
 
 typedef struct Pager {
@@ -54,6 +56,7 @@ typedef struct Pager {
   uint16_t peakUsed;       /* statistics: highest number of pool pages in use */
   /* dictionary (in flash), sorted by hash */
   const uint8_t* packBase;
+  const uint8_t* extBase; /* the pack's extension, or NULL */
   const uint8_t* dict; /* dictCount entries of NS_DICT_ENTRY_SIZE bytes */
   uint32_t dictCount;
   /* statistics */
@@ -68,7 +71,7 @@ extern const uint8_t ns_zeroPage[NS_PAGE_SIZE];
 
 /* pool must stay valid; poolBytes is rounded down to whole pages. */
 void pager_init(Pager* pg, uint8_t* pool, uint32_t poolBytes);
-void pager_setDictionary(Pager* pg, const uint8_t* packBase, const uint8_t* dict, uint32_t count);
+void pager_setDictionary(Pager* pg, const uint8_t* packBase, const uint8_t* extBase, const uint8_t* dict, uint32_t count);
 /* Takes bytes away from the end of the pool for another use (rounded up to
  * whole pages). Only right after pager_init: it resets the pager. Returns
  * NULL when the pool is too small. */

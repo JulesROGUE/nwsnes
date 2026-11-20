@@ -61,8 +61,9 @@ void* pager_carve(Pager* pg, uint32_t bytes) {
   return pg->pool + pg->poolBytes;
 }
 
-void pager_setDictionary(Pager* pg, const uint8_t* packBase, const uint8_t* dict, uint32_t count) {
+void pager_setDictionary(Pager* pg, const uint8_t* packBase, const uint8_t* extBase, const uint8_t* dict, uint32_t count) {
   pg->packBase = packBase;
+  pg->extBase = extBase;
   pg->dict = dict;
   pg->dictCount = dict ? count : 0;
 }
@@ -95,7 +96,11 @@ static const uint8_t* dictFind(const Pager* pg, uint32_t hash, const uint8_t* co
   for(; lo < pg->dictCount; lo++) {
     const uint8_t* e = pg->dict + lo * NS_DICT_ENTRY_SIZE;
     if(ns_rd32(e) != hash) break;
-    const uint8_t* cand = pg->packBase + ns_rd32(e + 4);
+    const uint32_t off = ns_rd32(e + 4);
+    const uint8_t* cand;
+    if(!(off & NS_DICT_IN_EXT)) cand = pg->packBase + off;
+    else if(pg->extBase) cand = pg->extBase + (off & ~NS_DICT_IN_EXT);
+    else continue;
     if(memcmp(cand, content, NS_PAGE_SIZE) == 0) return cand;
   }
   return NULL;

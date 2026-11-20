@@ -197,10 +197,11 @@ void EXPORT(nsw_profile_seed)(const uint8_t* pack, uint32_t size) {
 }
 
 /* Builds a pack from what was profiled. apuMode / frameSkip: 255 = automatic. */
-const uint8_t* EXPORT(nsw_build_pack)(uint32_t maxBytes, uint32_t apuMode, uint32_t frameSkip) {
+const uint8_t* EXPORT(nsw_build_pack)(uint32_t maxBytes, uint32_t apuMode, uint32_t frameSkip, uint32_t maxExtBytes) {
   NsPackParams params;
   fillParams(&params);
   params.maxPackBytes = maxBytes;
+  params.maxExtBytes = maxExtBytes;
   params.apuMode = (uint8_t)apuMode;
   params.frameSkip = (uint8_t)frameSkip;
   free(g_built);
@@ -212,6 +213,16 @@ const uint8_t* EXPORT(nsw_build_pack)(uint32_t maxBytes, uint32_t apuMode, uint3
  * entries, 4 of which found in the ROM, 5 of which stored, 6 left out,
  * 7 dropped while profiling, 8 ROM blocks (4 KB each), 9 of which the game
  * read, 10 of which are in the pack */
+/* Where on the calculator the extension of a pack goes (0: nowhere). See
+ * pack_extensionAddress(): the two descriptions are NS_FLASH_INFO_SIZE bytes
+ * each, or 0 for one that could not be read. */
+uint32_t EXPORT(nsw_ext_address)(uint32_t address, const uint8_t* thisInfo, const uint8_t* otherInfo, uint32_t extSize) {
+  return pack_extensionAddress(address, thisInfo, otherInfo, extSize);
+}
+
+/* ns_hashBytes() of a buffer, to check an extension against its pack */
+uint32_t EXPORT(nsw_hash_bytes)(const uint8_t* data, uint32_t length) { return ns_hashBytes(data, length); }
+
 uint32_t EXPORT(nsw_pack_stat)(int id) {
   switch(id) {
     case 0: return g_builtSize;
@@ -225,6 +236,9 @@ uint32_t EXPORT(nsw_pack_stat)(int id) {
     case 8: return g_builtStats.romBlocks;
     case 9: return g_builtStats.romBlocksRead;
     case 10: return g_builtStats.romBlocksPacked;
+    case 11: return g_builtStats.mainBytes;
+    case 12: return g_builtStats.extBytes;
+    case 13: return g_builtStats.romBlocksInExt;
     default: return 0;
   }
 }
