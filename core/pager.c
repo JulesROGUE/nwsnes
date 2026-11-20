@@ -51,6 +51,16 @@ void pager_init(Pager* pg, uint8_t* pool, uint32_t poolBytes) {
   pager_reset(pg);
 }
 
+void* pager_carve(Pager* pg, uint32_t bytes) {
+  const uint32_t pages = (bytes + NS_PAGE_SIZE - 1) >> NS_PAGE_SHIFT;
+  if(pages + 4 > pg->poolPages) return NULL;
+  pg->poolPages = (uint16_t)(pg->poolPages - pages);
+  pg->poolBytes = (uint32_t)pg->poolPages << NS_PAGE_SHIFT;
+  pg->lowWater = (uint16_t)(pg->poolPages / 8 < 4 ? 4 : pg->poolPages / 8);
+  pager_reset(pg);
+  return pg->pool + pg->poolBytes;
+}
+
 void pager_setDictionary(Pager* pg, const uint8_t* packBase, const uint8_t* dict, uint32_t count) {
   pg->packBase = packBase;
   pg->dict = dict;

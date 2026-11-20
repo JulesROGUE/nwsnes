@@ -19,8 +19,21 @@
  *  41  u8  1 if PAL
  *  42  u8  audio stand-in mode (0xff: automatic)
  *  43  u8  frame skip (0xff: automatic)
- *  44  u32 flags (0)
+ *  44  u32 flags: bit 0 = the ROM is not complete (version 2 only)
  *  48  char[16] title, zero padded
+ *
+ * Version 2 (header of 80 bytes) is used when the whole ROM does not fit in
+ * the calculator. The ROM is then stored as 4 KB blocks, and only the blocks
+ * the game was seen to read while it was played on the PC (plus their
+ * neighbours, as far as room allows) are in the pack:
+ *
+ *  64  u32 block table offset: one u32 per 4 KB block of the ROM, the offset
+ *      of the block in the pack, or 0xffffffff when it is not there
+ *  68  u32 number of blocks (rom size / 4096)
+ *  72  u32 number of blocks present
+ *  76  u32 reserved (0)
+ *
+ * In version 2 the "rom offset" field is where the stored blocks start.
  */
 #ifndef NWSNES_PACK_H
 #define NWSNES_PACK_H
@@ -33,12 +46,17 @@
 
 #define NS_PACK_MAGIC "NWSNESPK"
 #define NS_PACK_VERSION 1u
+#define NS_PACK_VERSION_BLOCKS 2u
 #define NS_PACK_HEADER_SIZE 64u
+#define NS_PACK_HEADER_SIZE_BLOCKS 80u
+#define NS_PACK_FLAG_PARTIAL 1u
 
 typedef struct NsPack {
   const uint8_t* base;
   uint32_t size;
-  const uint8_t* rom;
+  const uint8_t* rom;        /* the ROM in one piece, or NULL... */
+  const uint8_t* blockTable; /* ...when it comes as blocks (version 2) */
+  uint32_t blocksPresent;    /* blocks of the ROM that are in the pack */
   NsRomInfo info;
   const uint8_t* dict;
   uint32_t dictCount;
@@ -49,7 +67,8 @@ typedef struct NsPack {
 
 /* Validates the pack and fills out. Returns false if it is not usable. */
 bool pack_open(const uint8_t* data, size_t size, NsPack* out);
-/* Plugs an opened pack into a core (rom, dictionary, settings). */
-void pack_attach(const NsPack* pack, Snes* s);
+/* Plugs an opened pack into a core (rom, dictionary, settings). Returns false
+ * when the core's pool is too small to hold the table of ROM blocks. */
+bool pack_attach(const NsPack* pack, Snes* s);
 
 #endif

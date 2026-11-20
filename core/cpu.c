@@ -90,12 +90,14 @@ NS_INLINE bool cpu_eventsInPlace(const Snes* s) {
 NS_NOINLINE uint8_t cpu_read(Cpu* cpu, uint32_t adr) {
   Snes* s = (Snes*)cpu;
   const uint8_t* p;
+  uint32_t first;
   int32_t left = s->left;
   if(!(adr & 0x40e000)) { /* 0000-1fff of banks 00-3f and 80-bf */
     p = s->pager.ptr[NS_VP_WRAM + ((adr >> 8) & 0x1f)] + (adr & 0xff);
     left -= 8;
-  } else if((p = s->romHalf[(adr >> 15) & 0x1ff]) != NULL) {
-    p += adr & 0x7fff;
+  } else if((first = s->romHalfBlk[(adr >> 15) & 0x1ff]) != NS_NO_BLOCK &&
+            (p = s->cart.block[first + ((adr >> NS_ROM_BLOCK_SHIFT) & 7)]) != NULL) {
+    p += adr & (NS_ROM_BLOCK - 1);
     left -= s->romCycles[(adr >> 23) & 1];
   } else if((adr >> 17) == 0x3f) { /* 7e0000-7fffff */
     p = s->pager.ptr[NS_VP_WRAM + ((adr >> 8) & 0x1ff)] + (adr & 0xff);
@@ -173,10 +175,14 @@ NS_INLINE void cpu_checkInt(Cpu* cpu) {
  * event due, or a DMA pending */
 NS_NOINLINE uint8_t cpu_fetchSlow(Cpu* cpu, uint32_t pc) {
   Snes* s = (Snes*)cpu;
-  if(pc >= s->codeMin && !s->leftBias) {
-    s->left -= s->codeCycles;
-    snes_handleEvents(s);
-    return s->openBus = s->codePtr[pc];
+  if(!s->leftBias) {
+    /* out of the range codePtr covers: map the place the cpu is now at */
+    if(pc - s->codeLo >= s->codeLen) snes_mapCode(s, pc);
+    if(pc - s->codeLo < s->codeLen) {
+      s->left -= s->codeCycles;
+      if(s->left <= 0) snes_handleEvents(s);
+      return s->openBus = s->codePtr[pc];
+    }
   }
   return snes_cpuRead(s, ((uint32_t)cpu->k << 16) | pc);
 }
@@ -185,7 +191,7 @@ NS_INLINE uint8_t cpu_readOpcode(Cpu* cpu) {
   Snes* s = (Snes*)cpu;
   const uint32_t pc = cpu->pc;
   cpu->pc = (uint16_t)(pc + 1);
-  if(NS_LIKELY(pc >= s->codeMin)) {
+  if(NS_LIKELY(pc - s->codeLo < s->codeLen)) {
     const int32_t left = s->left - s->codeCycles;
     if(NS_LIKELY(left > 0)) {
       s->left = left;
@@ -201,7 +207,7 @@ NS_NOINLINE uint16_t cpu_readOpcodeWord(Cpu* cpu, bool intCheck) {
   Snes* s = (Snes*)cpu;
   const uint32_t pc = cpu->pc;
   const int32_t left = s->left - 2 * s->codeCycles;
-  if(NS_LIKELY(pc >= s->codeMin) && NS_LIKELY(pc < 0xffff) && NS_LIKELY(left > 0)) {
+  if(NS_LIKELY(pc - s->codeLo < s->codeLen) && NS_LIKELY(pc + 1 - s->codeLo < s->codeLen) && NS_LIKELY(left > 0)) {
     const uint8_t* p = s->codePtr + pc;
     cpu->pc = (uint16_t)(pc + 2);
     s->left = left;

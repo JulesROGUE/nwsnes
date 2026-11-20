@@ -56,7 +56,7 @@ reset = reset.replace('  memset(ppu->vram, 0, sizeof(ppu->vram));\n', '')
 reset = reset.replace('  memset(ppu->objPixelBuffer, 0, sizeof(ppu->objPixelBuffer));\n  memset(ppu->objPriorityBuffer, 0, sizeof(ppu->objPriorityBuffer));\n',
                       '  memset(ppu->objRow, 0, sizeof(ppu->objRow));\n  memset(ppu->objSlivers, 0, sizeof(ppu->objSlivers));\n'
                       '  memset(ppu->objPrioMask, 0, sizeof(ppu->objPrioMask));\n  ppu->renderedLine = 0;\n  ppu->palBlendKey[0] = 0xffffffffu;\n'
-                      '  ppu->regKnown = 0;\n'
+                      '  ppu->regKnown = 0;\n  ppu->wlogCount = 0;\n'
                       '  ppu->lutBrightness = 0xff;\n')
 reset = reset.replace('  memset(ppu->pixelBuffer, 0, sizeof(ppu->pixelBuffer));\n', '')
 assert 'vram' not in reset.replace('vramPointer','').replace('vramIncrement','').replace('vramRemap','').replace('vramRead','').replace('video RAM','')
@@ -77,7 +77,7 @@ rd = rd.replace('ppu->hCount = s->hPos / 4;', 'ppu->hCount = (uint16_t)(snes_hPo
 assert 'snes_hPos' in rd
 # nwsnes: the picture is drawn late; reading the sprite flags or stepping
 # through OAM needs it to be up to date first
-rd = rd.replace('  Ppu* ppu = &s->ppu;\n', '  Ppu* ppu = &s->ppu;\n  if(adr == 0x38 || adr == 0x3e) ppu_flush(s);\n', 1)
+rd = rd.replace('  Ppu* ppu = &s->ppu;\n', '  Ppu* ppu = &s->ppu;\n  if(ppu->wlogCount || adr == 0x38 || adr == 0x3e) ppu_flush(s);\n', 1)
 assert 'ppu->vram[' not in rd
 regs += rd + '\n'
 
@@ -93,23 +93,14 @@ wr = wr.replace('''      uint16_t vramAdr = ppu_getVramRemap(ppu);
 '''      uint32_t vramAdr = ppu_getVramRemap(ppu) & 0x7fff;
       pager_write(&s->pager, NS_VP_VRAM + (vramAdr >> 7), ((vramAdr & 0x7f) << 1) | 1, val);''')
 wr = wr.replace('ppu->snes->', 's->')
-# nwsnes: the picture is drawn late: before a register changes, draw the lines
-# that were due with the old value. Nothing is ever due during vertical blanking.
-wr = wr.replace('  Ppu* ppu = &s->ppu;\n', '''  Ppu* ppu = &s->ppu;
-  adr &= 0x3f;
-  if(!s->inVblank) {
-    /* nwsnes: the picture is drawn late. Before a register changes, the lines
-     * that are due are drawn with the old value... unless the write cannot
-     * change the picture: games that drive a register from HDMA often send
-     * the same value on every line */
-    const uint8_t kind = kRegKind[adr];
-    if(!(kind == 2 || (kind == 1 && ((ppu->regKnown >> adr) & 1) && ppu->regLast[adr] == val))) ppu_flush(s);
-  }
-  ppu->regLast[adr] = val;
-  ppu->regKnown |= 1ull << adr;
-''', 1)
+# nwsnes: the picture is drawn late. LakeSnes' function becomes ppu_apply (the
+# register write itself); ppu_write decides whether it happens now or is
+# written down to be replayed when the lines are drawn.
+wr = wr.replace('void ppu_write(Snes* s, uint8_t adr, uint8_t val) {\n  Ppu* ppu = &s->ppu;\n',
+                'void ppu_apply(Snes* s, uint8_t adr, uint8_t val) {\n  Ppu* ppu = &s->ppu;\n', 1)
+assert 'void ppu_apply(' in wr
 wr = '''/* nwsnes: what a write to each register means for the picture.
- * 0: anything (always draw the lines that are due first);
+ * 0: anything;
  * 1: the register just holds the value: writing the same one again changes nothing;
  * 2: the picture does not depend on it (video ram and palette addresses,
  *    video port control, read-only registers). */
@@ -120,8 +111,41 @@ static const uint8_t kRegKind[0x40] = {
   1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2  /* 30-3f */
 };
 
+/* nwsnes: the picture is drawn late, in one go (see ppu.c). While the
+ * visible lines go by, a write that can change the picture is not done
+ * right away: it is written down with the line it takes effect after, and
+ * ppu_flush replays the list while it draws. The game cannot tell: anything
+ * that reads the PPU flushes first (ppu_read). This is what keeps a game that
+ * changes a register on every line (HDMA) from interrupting itself 224 times
+ * per frame to draw one line. */
+void ppu_write(Snes* s, uint8_t adr, uint8_t val) {
+  Ppu* ppu = &s->ppu;
+  adr &= 0x3f;
+  const uint8_t kind = kRegKind[adr];
+  const bool same = kind == 1 && ((ppu->regKnown >> adr) & 1) && ppu->regLast[adr] == val;
+  ppu->regLast[adr] = val;
+  ppu->regKnown |= 1ull << adr;
+  if(s->inVblank || !s->renderFrame || s->refPpu || s->vPos == 0) {
+    ppu_apply(s, adr, val);
+    return;
+  }
+  if(same) return; /* games driving a register from HDMA often send the same value on every line */
+  int due = snes_hPos(s) >= 512 ? s->vPos : s->vPos - 1;
+  if(due > NS_SCREEN_H_OVERSCAN) due = NS_SCREEN_H_OVERSCAN;
+  if(ppu->wlogCount == 0 && (kind == 2 || due <= ppu->renderedLine)) {
+    ppu_apply(s, adr, val); /* nothing is waiting, and no line is due before it */
+    return;
+  }
+  if(adr == 0x06) { /* mosaic: remembers the line it is written on */
+    ppu_flush(s);
+    ppu_apply(s, adr, val);
+    return;
+  }
+  if(ppu->wlogCount == NS_WLOG) ppu_flush(s);
+  ppu->wlog[ppu->wlogCount++] = ((uint32_t)due << 16) | ((uint32_t)adr << 8) | val;
+}
+
 ''' + wr
-assert 'ppu->vram[' not in wr
 regs += wr
 regs = re.sub(r'      // fallthrough to normal layer BG-[HV]OFS\n    \}\n', '    }\n    /* fallthrough */\n', regs)
 # nwsnes: keep the RGB565 palette and the visible sprite list up to date

@@ -152,7 +152,13 @@ int main(int argc, char* argv[]) {
   }
 
   snes_init(&snes, pool, poolBytes, putRows, NULL);
-  pack_attach(&pack, &snes);
+  if(!pack_attach(&pack, &snes)) {
+    text(0, "nwsnes");
+    text(2, "Pas assez de memoire vive");
+    text(3, "pour ce jeu.");
+    waitKey();
+    return 0;
+  }
   snes_reset(&snes, true);
 
   /* start screen. It stays up until a key is pressed so the RAM figure can
@@ -171,6 +177,14 @@ int main(int argc, char* argv[]) {
   p = putNum(p, pack.dictCount);
   putStr(p, " pages");
   text(5, buf);
+  if(pack.blockTable) {
+    /* a game too big for the flash: only the part played on the PC is here */
+    p = putStr(buf, "ROM: ");
+    p = putNum(p, pack.blocksPresent * 4);
+    p = putStr(p, " Ko sur ");
+    p = putNum(p, pack.info.romSize / 1024);
+    text(6, buf);
+  }
   text(7, "0: stats   Maison: quitter");
   text(9, "Appuyez sur OK");
   waitKey();
@@ -212,6 +226,17 @@ int main(int argc, char* argv[]) {
     statsFrames++;
     statsDrawn += render;
 
+    if(snes.romMissing) {
+      eadk_display_push_rect_uniform(eadk_screen_rect, eadk_color_black);
+      text(0, "Fin de la partie installee");
+      text(2, "Ce jeu est trop gros pour la");
+      text(3, "calculatrice: seule la partie");
+      text(4, "jouee sur PC est installee.");
+      text(5, "Rejouez ce passage sur PC avec");
+      text(6, "snes2nw puis reinstallez.");
+      waitKey();
+      return 0;
+    }
     if(snes.pager.oom) {
       eadk_display_push_rect_uniform(eadk_screen_rect, eadk_color_black);
       text(0, "Memoire pleine");

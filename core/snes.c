@@ -59,17 +59,40 @@ void snes_init(Snes* s, uint8_t* pool, uint32_t poolBytes, NsPutRows putRows, vo
   s->user = user;
   s->renderFrame = true;
   s->speedHacks = true;
-  s->codeMin = 0x10000;
   s->apu.forcedMode = 0xff;
 }
 
-void snes_setRom(Snes* s, const uint8_t* rom, const NsRomInfo* info) {
+static bool setCart(Snes* s, const NsRomInfo* info) {
+  const uint32_t blocks = info->romSize >> NS_ROM_BLOCK_SHIFT;
+  s->cart.type = NS_CART_NONE;
+  if(blocks == 0 || blocks > 0x4000) return false;
+  if(!s->cart.block || s->cart.romSize != info->romSize) {
+    s->cart.block = pager_carve(&s->pager, blocks * (uint32_t)sizeof(const uint8_t*));
+    if(!s->cart.block) return false;
+  }
   s->cart.type = info->cartType;
-  s->cart.rom = rom;
   s->cart.romSize = info->romSize;
   s->cart.ramSize = info->ramSize > 0x8000 ? 0x8000 : info->ramSize;
   s->palTiming = info->pal;
+  s->romMissing = false;
+  return true;
+}
+
+bool snes_setRom(Snes* s, const uint8_t* rom, const NsRomInfo* info) {
+  if(!setCart(s, info)) return false;
+  for(uint32_t i = 0; i < info->romSize >> NS_ROM_BLOCK_SHIFT; i++) s->cart.block[i] = rom + (i << NS_ROM_BLOCK_SHIFT);
   mapRom(s);
+  return true;
+}
+
+bool snes_setRomBlocks(Snes* s, const uint8_t* base, const uint8_t* table, const NsRomInfo* info) {
+  if(!setCart(s, info)) return false;
+  for(uint32_t i = 0; i < info->romSize >> NS_ROM_BLOCK_SHIFT; i++) {
+    const uint32_t off = ns_rd32(table + i * 4);
+    s->cart.block[i] = off == 0xffffffffu ? NULL : base + off;
+  }
+  mapRom(s);
+  return true;
 }
 
 void snes_reset(Snes* s, bool hard) {
@@ -129,6 +152,10 @@ void snes_runFrame(Snes* s) {
   } else
 #endif
   cpu_run(s);
+  /* Nothing is left waiting between two frames. (It only can be when a
+   * frame ends late, in the middle of the next picture: the cpu was inside a
+   * DMA longer than the vertical blanking when it started.) */
+  if(s->ppu.wlogCount) ppu_flush(s);
   apu_frame(s);
   pager_frameEnd(&s->pager);
 }
@@ -195,6 +222,7 @@ static void lineStart(Snes* s) {
     s->ppu.renderedLine = 0;
     ppu_handleFrameStart(s);
   } else if(s->vPos == 225) {
+    ppu_flush(s); /* the overscan setting may be among the writes that wait */
     startingVblank = !ppu_checkOverscan(s);
   } else if(s->vPos == 240) {
     if(!s->inVblank) startingVblank = true;
@@ -372,7 +400,18 @@ static uint8_t cartRead(Snes* s, uint32_t bank, uint32_t adr) {
   int32_t off = cartSramOffset(c, bank, adr);
   if(off >= 0) return sramRead(s, (uint32_t)off);
   off = cartRomOffset(c, bank, adr);
-  if(off >= 0) return c->rom[off];
+  if(off >= 0) {
+    if(s->romTrace) s->romTrace[off >> 8] = 1;
+    const uint8_t* block = c->block[off >> NS_ROM_BLOCK_SHIFT];
+    if(block) return block[off & (NS_ROM_BLOCK - 1)];
+    /* a part of the game that is not in the pack: nothing sensible can
+     * follow, so the cpu is stopped and the front end tells the user */
+    if(!s->romMissing) {
+      s->romMissing = true;
+      s->romMissingAt = (uint32_t)off;
+    }
+    s->cpu.stopped = true;
+  }
   return s->openBus;
 }
 
@@ -639,43 +678,50 @@ static inline int accessTime(const Snes* s, uint32_t adr) {
 
 /* ----------------------------------------------------------- speed-ups -- */
 
-/* Fills romHalf: where the cpu core may read ROM bytes straight from the
- * image instead of decoding the address. Built from the same two functions
+/* Fills romHalfBlk: where the cpu core may read ROM bytes straight from the
+ * blocks instead of decoding the address. Built from the same two functions
  * cartRead() uses, so both always agree. */
 static void mapRom(Snes* s) {
   const Cart* c = &s->cart;
   for(uint32_t h = 0; h < 512; h++) {
     const uint32_t bank = h >> 1;
     const uint32_t adr = (h & 1) << 15;
-    const uint8_t* p = NULL;
-    if(bank != 0x7e && bank != 0x7f && c->rom && c->romSize >= 0x8000 && cartSramOffset(c, bank, adr) < 0) {
+    uint16_t first = NS_NO_BLOCK;
+    if(!s->romTrace && bank != 0x7e && bank != 0x7f && c->block && c->romSize >= 0x8000 && cartSramOffset(c, bank, adr) < 0) {
       const int32_t off = cartRomOffset(c, bank, adr);
-      if(off >= 0) p = c->rom + off;
+      if(off >= 0) first = (uint16_t)(off >> NS_ROM_BLOCK_SHIFT);
     }
-    s->romHalf[h] = p;
+    s->romHalfBlk[h] = first;
   }
   s->romCycles[0] = 8;
   s->romCycles[1] = s->fastMem ? 6 : 8;
   snes_setCodeBank(s);
 }
 
-/* Opcode bytes are nearly always fetched from ROM: remember where the
- * program bank sits in the image so that a fetch is one load. */
-void snes_setCodeBank(Snes* s) {
+/* Opcode bytes are nearly always fetched from ROM: remember where the code
+ * around pc sits, so that a fetch is one load. The range covers the blocks
+ * that follow each other in flash, within the 32 KB half pc is in. */
+void snes_mapCode(Snes* s, uint32_t pc) {
   const uint32_t k = s->cpu.k;
-  const uint8_t* lo = s->romHalf[k * 2];
-  const uint8_t* hi = s->romHalf[k * 2 + 1];
   s->codeCycles = s->romCycles[k >> 7];
-  if(hi && lo && lo + 0x8000 == hi) {
-    s->codePtr = lo;
-    s->codeMin = 0;
-  } else if(hi) {
-    s->codePtr = hi - 0x8000;
-    s->codeMin = 0x8000;
-  } else {
-    s->codePtr = NULL;
-    s->codeMin = 0x10000;
-  }
+  s->codeLo = 0;
+  s->codeLen = 0;
+  s->codePtr = NULL;
+  const uint32_t first = s->romHalfBlk[(k << 1) | ((pc >> 15) & 1)];
+  if(first == NS_NO_BLOCK) return;
+  const uint8_t** blk = s->cart.block + first;
+  uint32_t lo = (pc >> NS_ROM_BLOCK_SHIFT) & 7;
+  uint32_t hi = lo;
+  if(!blk[lo]) return;
+  while(lo > 0 && blk[lo - 1] && blk[lo - 1] + NS_ROM_BLOCK == blk[lo]) lo--;
+  while(hi < 7 && blk[hi + 1] && blk[hi] + NS_ROM_BLOCK == blk[hi + 1]) hi++;
+  s->codeLo = (pc & 0x8000) + (lo << NS_ROM_BLOCK_SHIFT);
+  s->codeLen = (hi - lo + 1) << NS_ROM_BLOCK_SHIFT;
+  s->codePtr = blk[lo] - s->codeLo;
+}
+
+void snes_setCodeBank(Snes* s) {
+  snes_mapCode(s, s->cpu.pc);
 }
 
 /* The cpu is going round a loop that changes nothing: only an interrupt or

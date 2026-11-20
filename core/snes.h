@@ -135,6 +135,8 @@ typedef struct WindowLayer {
 #define NS_SCREEN_H_OVERSCAN 239
 /* The picture is drawn late and in bands of this many lines (see ppu.c) */
 #define NS_BAND 16
+/* how many register writes can wait for the picture to be drawn */
+#define NS_WLOG 256
 /* at most 34 sprite tiles (8 pixels wide) are fetched for a line */
 #define NS_SLIVERS 34
 
@@ -226,6 +228,10 @@ typedef struct Ppu {
   uint8_t renderedLine;  /* last line of this frame already drawn (0: none) */
   uint8_t regLast[0x40]; /* last value written to each register... */
   uint64_t regKnown;     /* ...when its bit is set here */
+  /* register writes waiting for the lines before them to be drawn:
+   * line << 16 | register << 8 | value */
+  uint32_t wlog[NS_WLOG];
+  uint16_t wlogCount;
   uint32_t statFastLines; /* statistics: lines drawn by the fast path... */
   uint32_t statSlowLines; /* ...and by the general renderer */
   uint32_t statWhy[8];    /* ...because of: see the WHY_ codes in ppu.c */
@@ -273,16 +279,24 @@ void ppu_refRunLine(Snes* s, int line); /* LakeSnes' per-pixel renderer */
 #endif
 uint8_t ppu_read(Snes* s, uint8_t adr);
 void ppu_write(Snes* s, uint8_t adr, uint8_t val);
+void ppu_apply(Snes* s, uint8_t adr, uint8_t val); /* the write itself, see ppu_write */
 
 /* --------------------------------------------------------------- cart -- */
 
 enum { NS_CART_NONE = 0, NS_CART_LOROM = 1, NS_CART_HIROM = 2, NS_CART_EXHIROM = 3 };
 
+/* The ROM is cut in blocks of 4 KB. They need not be next to each other in
+ * flash, and need not all be there: a pack may hold only the part of a big
+ * game that was played on the PC (see pack.h). */
+#define NS_ROM_BLOCK_SHIFT 12
+#define NS_ROM_BLOCK 4096u
+#define NS_NO_BLOCK 0xffffu
+
 typedef struct Cart {
   uint8_t type;
-  const uint8_t* rom; /* in flash; romSize is a power of two */
-  uint32_t romSize;
-  uint32_t ramSize;   /* battery RAM, power of two or 0; lives in the pager */
+  uint32_t romSize;      /* size of the whole ROM, a power of two */
+  uint32_t ramSize;      /* battery RAM, power of two or 0; lives in the pager */
+  const uint8_t** block; /* romSize / 4 KB entries: where each block is, or NULL when it is not in the pack */
 } Cart;
 
 /* ------------------------------------------------- audio CPU stand-in -- */
@@ -334,8 +348,9 @@ struct Snes {
   Cpu cpu; /* must stay first: the cpu core casts Cpu* to Snes* */
   /* ---- hot: read on every bus access of the cpu core ---- */
   int32_t left;           /* master cycles until snes_handleEvents must run (<= 0: now) */
-  const uint8_t* codePtr; /* codePtr[pc] is the opcode byte, for pc >= codeMin */
-  uint32_t codeMin;       /* 0, 0x8000, or 0x10000 when the program bank is not plain ROM */
+  const uint8_t* codePtr; /* codePtr[pc] is the opcode byte, for codeLo <= pc < codeLo + codeLen */
+  uint32_t codeLo;
+  uint32_t codeLen;       /* 0 when the place the cpu runs from is not plain ROM */
   uint8_t codeCycles;     /* access time of the program bank */
   uint8_t openBus;
   bool loopDirty;         /* the cpu wrote to the bus since the last wait-loop check */
@@ -343,6 +358,10 @@ struct Snes {
   uint8_t romCycles[2];   /* access time of ROM in banks 00-7f / 80-ff */
   bool speedHacks;        /* skip loops that only wait; clear for exact timing */
   bool refCpu;            /* host builds only: use the reference interpreter */
+  bool romMissing;        /* the game read a part of the ROM that is not in the pack: it is stopped */
+  uint32_t romMissingAt;  /* ...at this offset of the ROM */
+  uint8_t* romTrace;      /* PC tools: one byte per 256-byte page of the ROM, set when the game reads it
+                             (all ROM reads then take the slow path); NULL otherwise */
   int32_t leftBias;       /* NS_DMA_BIAS while a DMA is pending, else 0 */
   /* ---- timing ---- */
   uint16_t nextEvent; /* position in the line (hPos) at which snes_handleEvents must run */
@@ -392,9 +411,10 @@ struct Snes {
   Cart cart;
   ApuStub apu;
   Pager pager;
-  /* Where each 32 KB half of each bank sits in the ROM image, or NULL when
-   * that half is not plain ROM (system area, work ram, battery ram). */
-  const uint8_t* romHalf[512];
+  /* Which ROM block each 32 KB half of each bank starts at (it covers 8 of
+   * them), or NS_NO_BLOCK when that half is not plain ROM (system area, work
+   * ram, battery ram). */
+  uint16_t romHalfBlk[512];
   Dma dma;
   Ppu ppu;
 };
@@ -409,7 +429,12 @@ typedef struct NsRomInfo {
 
 /* The caller provides the RAM pool. Nothing is allocated by the core. */
 void snes_init(Snes* s, uint8_t* pool, uint32_t poolBytes, NsPutRows putRows, void* user);
-void snes_setRom(Snes* s, const uint8_t* rom, const NsRomInfo* info);
+/* The ROM in one piece (rom), or as a table of 4 KB blocks: romSize / 4096
+ * little-endian u32, each the offset of a block from base, or 0xffffffff for
+ * a block that is not there. The table of pointers is taken from the pool.
+ * Returns false when there is not enough RAM for it. */
+bool snes_setRom(Snes* s, const uint8_t* rom, const NsRomInfo* info);
+bool snes_setRomBlocks(Snes* s, const uint8_t* base, const uint8_t* table, const NsRomInfo* info);
 void snes_reset(Snes* s, bool hard);
 void snes_runFrame(Snes* s);
 static inline void snes_setPad(Snes* s, int player, uint16_t buttons) { s->pad[player & 1] = buttons; }
@@ -427,6 +452,7 @@ uint8_t snes_cpuRead(Snes* s, uint32_t adr);
 void snes_cpuWrite(Snes* s, uint32_t adr, uint8_t val);
 void snes_syncCycles(Snes* s, bool start, int syncCycles);
 void snes_setCodeBank(Snes* s); /* after cpu.k or the memory map changed */
+void snes_mapCode(Snes* s, uint32_t pc); /* makes codePtr valid around pc, when that is ROM */
 void snes_skipToEvent(Snes* s);
 void snes_skipToInterrupt(Snes* s);
 

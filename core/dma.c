@@ -128,7 +128,7 @@ static void transferByte(Snes* s, uint16_t aAdr, uint8_t aBank, uint8_t bAdr, bo
 
 /* Where the bytes of an A-bus address can be read directly: work ram or
  * ROM. Returns how many bytes follow at increasing addresses without leaving
- * that page (work ram) or that half bank (ROM); 0 when the address is
+ * that page (work ram) or that block (ROM); 0 when the address is
  * something else (registers, battery ram, open bus). */
 typedef struct DmaSource {
   const uint8_t* rom; /* ROM: the byte itself */
@@ -150,10 +150,13 @@ static uint32_t dmaSource(const Snes* s, uint32_t bank, uint32_t adr, DmaSource*
     src->off = adr & 0xff;
     return 0x100 - src->off;
   }
-  const uint8_t* half = s->romHalf[(bank << 1) | (adr >> 15)];
-  if(half) {
-    src->rom = half + (adr & 0x7fff);
-    return 0x8000 - (adr & 0x7fff);
+  const uint32_t first = s->romHalfBlk[(bank << 1) | (adr >> 15)];
+  if(first != NS_NO_BLOCK) {
+    const uint8_t* block = s->cart.block[first + ((adr >> NS_ROM_BLOCK_SHIFT) & 7)];
+    if(block) {
+      src->rom = block + (adr & (NS_ROM_BLOCK - 1));
+      return NS_ROM_BLOCK - (adr & (NS_ROM_BLOCK - 1));
+    }
   }
   return 0;
 }

@@ -119,7 +119,7 @@ volatile uint32_t bench_marker;
 /* drawEvery: 1 = every frame, 0 = never, n = one frame out of n */
 static uint64_t run(const NsPack* pack, uint32_t drawEvery, uint32_t* oomAt) {
   snes_init(&snes, pool, sizeof(pool), putRows, 0);
-  pack_attach(pack, &snes);
+  if(!pack_attach(pack, &snes)) out("bench: no room for the ROM block table\n");
   snes_reset(&snes, true);
   *oomAt = 0xffffffffu;
   uint64_t t0 = 0;

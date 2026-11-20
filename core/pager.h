@@ -69,6 +69,10 @@ extern const uint8_t ns_zeroPage[NS_PAGE_SIZE];
 /* pool must stay valid; poolBytes is rounded down to whole pages. */
 void pager_init(Pager* pg, uint8_t* pool, uint32_t poolBytes);
 void pager_setDictionary(Pager* pg, const uint8_t* packBase, const uint8_t* dict, uint32_t count);
+/* Takes bytes away from the end of the pool for another use (rounded up to
+ * whole pages). Only right after pager_init: it resets the pager. Returns
+ * NULL when the pool is too small. */
+void* pager_carve(Pager* pg, uint32_t bytes);
 /* points every virtual page back to the zero page and frees the whole pool */
 void pager_reset(Pager* pg);
 /* gives back every RAM page whose content is zero or known; returns pages freed */

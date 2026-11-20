@@ -34,6 +34,7 @@ static Snes g_snes;
 static NsPack g_pack;
 static uint8_t* g_pool;
 static uint16_t g_fb[NS_SCREEN_W * NS_SCREEN_H_OVERSCAN];
+static uint8_t* g_romUsed;      /* which 256-byte pages of the ROM the game read, over all sessions */
 static const uint16_t* g_movie; /* recorded inputs, one per frame, or NULL */
 static uint32_t g_movieLen;
 
@@ -60,16 +61,20 @@ static void fillParams(NsPackParams* params) {
   params->title = g_hdr.title;
   params->apuMode = 0xff;
   params->frameSkip = 0xff;
+  params->romUsed = g_romUsed;
 }
 
 /* Loads a ROM file. Returns 0, or 1 when no SNES header is recognised. */
 int EXPORT(nsw_load_rom)(const uint8_t* file, uint32_t size) {
   free(g_rom);
   free(g_basePack);
-  g_rom = g_basePack = NULL;
+  free(g_romUsed);
+  g_rom = g_basePack = g_romUsed = NULL;
   ns_readRomHeader(file, (int)size, &g_hdr);
   if(!g_hdr.valid) return 1;
   g_rom = ns_padRom(file + g_hdr.copierHeader, size - (uint32_t)g_hdr.copierHeader, &g_romSize);
+  g_romUsed = calloc(g_romSize >> NS_PAGE_SHIFT, 1);
+  if(!g_rom || !g_romUsed) return 2;
   NsPackParams params;
   fillParams(&params);
   g_basePack = prof_buildPack(NULL, &params, &g_basePackSize, NULL);
@@ -100,6 +105,9 @@ uint32_t EXPORT(nsw_info)(int id) {
 /* pack == NULL: the loaded ROM without dictionary. poolPages == 0: unlimited.
  * Returns 0 on success. The pack memory must stay allocated. */
 int EXPORT(nsw_session)(const uint8_t* pack, uint32_t packSize, uint32_t poolPages, int exact) {
+  /* sessions on the whole ROM are the ones that teach what the game needs:
+   * they also record which parts of the ROM it reads */
+  const bool learn = pack == NULL;
   if(!pack) {
     pack = g_basePack;
     packSize = g_basePackSize;
@@ -111,18 +119,20 @@ int EXPORT(nsw_session)(const uint8_t* pack, uint32_t packSize, uint32_t poolPag
   if(!g_pool) return 2;
   memset(g_fb, 0, sizeof(g_fb));
   snes_init(&g_snes, g_pool, poolPages * NS_PAGE_SIZE, putRows, NULL);
-  pack_attach(&g_pack, &g_snes);
+  g_snes.romTrace = learn ? g_romUsed : NULL;
+  if(!pack_attach(&g_pack, &g_snes)) return 3;
   if(exact) g_snes.speedHacks = false;
   snes_reset(&g_snes, true);
   return 0;
 }
 
-/* Runs one frame with the given buttons. Returns 1 if RAM ran out. */
+/* Runs one frame with the given buttons. Returns 1 if RAM ran out, 2 if the
+ * game read a part of the ROM that is not in the session's pack. */
 int EXPORT(nsw_frame)(uint32_t pad, int sample) {
   snes_setPad(&g_snes, 0, (uint16_t)pad);
   snes_runFrame(&g_snes);
   if(sample && g_prof) prof_sample(g_prof, &g_snes);
-  return g_snes.pager.oom;
+  return g_snes.romMissing ? 2 : g_snes.pager.oom;
 }
 
 /* Runs frames [start, start + count) with automatic (or recorded) inputs.
@@ -133,7 +143,7 @@ uint32_t EXPORT(nsw_run)(uint32_t count, uint32_t seed, uint32_t start, int flag
   for(uint32_t i = 0; i < count; i++) {
     snes_setPad(&g_snes, 0, inputAt(seed, start + i));
     snes_runFrame(&g_snes);
-    if(g_snes.pager.oom) return i;
+    if(g_snes.pager.oom || g_snes.romMissing) return i;
     if((flags & 1) && g_prof) prof_sample(g_prof, &g_snes);
     if(flags & 2) pager_collect(&g_snes.pager);
   }
@@ -150,7 +160,8 @@ void EXPORT(nsw_movie)(const uint16_t* frames, uint32_t count) {
 
 /* 0 pool pages, 1 pages in use, 2 peak in use, 3 copy-on-writes,
  * 4 collections, 5 given back as zero, 6 given back to the dictionary,
- * 7 out of memory, 8 dictionary entries of the session's pack */
+ * 7 out of memory, 8 dictionary entries of the session's pack, 9 the game
+ * read a part of the ROM that is not in the pack, 10 at which ROM offset */
 uint32_t EXPORT(nsw_stat)(int id) {
   const Pager* pg = &g_snes.pager;
   switch(id) {
@@ -163,6 +174,8 @@ uint32_t EXPORT(nsw_stat)(int id) {
     case 6: return pg->statDedupDict;
     case 7: return pg->oom;
     case 8: return pg->dictCount;
+    case 9: return g_snes.romMissing;
+    case 10: return g_snes.romMissingAt;
     default: return 0;
   }
 }
@@ -179,6 +192,8 @@ int EXPORT(nsw_profile_reset)(void) {
 
 void EXPORT(nsw_profile_seed)(const uint8_t* pack, uint32_t size) {
   if(g_prof) prof_seed(g_prof, pack, size);
+  /* a pack that holds only part of the ROM: keep that part */
+  if(g_romUsed) prof_seedRomUse(pack, size, g_romUsed, g_romSize);
 }
 
 /* Builds a pack from what was profiled. apuMode / frameSkip: 255 = automatic. */
@@ -195,7 +210,8 @@ const uint8_t* EXPORT(nsw_build_pack)(uint32_t maxBytes, uint32_t apuMode, uint3
 
 /* 0 size in bytes, 1 frames profiled, 2 candidate pages, 3 dictionary
  * entries, 4 of which found in the ROM, 5 of which stored, 6 left out,
- * 7 dropped while profiling */
+ * 7 dropped while profiling, 8 ROM blocks (4 KB each), 9 of which the game
+ * read, 10 of which are in the pack */
 uint32_t EXPORT(nsw_pack_stat)(int id) {
   switch(id) {
     case 0: return g_builtSize;
@@ -206,6 +222,9 @@ uint32_t EXPORT(nsw_pack_stat)(int id) {
     case 5: return g_builtStats.dictStored;
     case 6: return g_builtStats.dictLeftOut;
     case 7: return g_builtStats.dropped;
+    case 8: return g_builtStats.romBlocks;
+    case 9: return g_builtStats.romBlocksRead;
+    case 10: return g_builtStats.romBlocksPacked;
     default: return 0;
   }
 }

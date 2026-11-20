@@ -68,8 +68,11 @@ uint8_t apu_read(Snes* s, uint8_t port) {
 
 void apu_write(Snes* s, uint8_t port, uint8_t val) {
   ApuStub* a = &s->apu;
+  /* a game that keeps sending the same value while it polls is waiting too
+   * (a "reset" command repeated until the boot ROM answers): only a new
+   * value counts as progress */
+  if(a->in[port] != val) a->idleReads = 0;
   a->in[port] = val;
-  a->idleReads = 0;
   if(a->forcedMode != 0xff) return;
   /* $CC on port 0 while the boot ROM is ready starts an upload: from then on
    * every byte is acknowledged by echoing port 0 */

@@ -26,6 +26,10 @@ typedef struct NsPackParams {
   uint8_t frameSkip;     /* 0xff: automatic */
   const char* title;
   uint32_t maxPackBytes; /* flash budget for the whole pack */
+  /* One byte per 256-byte page of the ROM, non-zero when the game read it
+   * (Snes.romTrace), or NULL. When the whole ROM does not fit in the budget,
+   * this decides which 4 KB blocks of it go in the pack. */
+  const uint8_t* romUsed;
 } NsPackParams;
 
 typedef struct NsPackStats {
@@ -37,6 +41,9 @@ typedef struct NsPackStats {
   uint32_t dictStored;     /* of which are stored as 256 bytes of flash */
   uint32_t dictLeftOut;    /* candidates that did not fit in the budget */
   uint32_t packBytes;
+  uint32_t romBlocks;      /* 4 KB blocks in the ROM */
+  uint32_t romBlocksRead;  /* blocks the game was seen to read */
+  uint32_t romBlocksPacked;/* blocks in the pack (all of them when the ROM fits) */
 } NsPackStats;
 
 NsProfiler* prof_new(void);
@@ -46,6 +53,9 @@ void prof_free(NsProfiler* p);
 void prof_seed(NsProfiler* p, const uint8_t* packData, uint32_t packSize);
 /* call once per emulated frame */
 void prof_sample(NsProfiler* p, const Snes* s);
+/* marks in romUsed (one byte per 256-byte page) the parts of the ROM an
+ * existing pack holds, so that rebuilding it does not lose them */
+void prof_seedRomUse(const uint8_t* packData, uint32_t packSize, uint8_t* romUsed, uint32_t romSize);
 /* returns a malloc'ed pack (NULL on failure); stats may be NULL */
 uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_t* outSize, NsPackStats* stats);
 /* pads/mirrors a ROM image to a power of two; returns a malloc'ed copy */

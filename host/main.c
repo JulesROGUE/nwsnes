@@ -113,13 +113,15 @@ static bool loadScript(const char* path, Inputs* in, uint32_t frames) {
 /* -------------------------------------------------------------- session -- */
 
 static bool g_exact; /* --exact: no speed-ups in the device configuration */
+static uint8_t* g_romTrace; /* --profile: which 256-byte pages of the ROM the game reads */
 
 static Session* sessionNew(const NsPack* pack, uint32_t poolPages, bool refPpu) {
   Session* se = calloc(1, sizeof(Session));
   se->poolBytes = poolPages * NS_PAGE_SIZE;
   se->pool = malloc(se->poolBytes ? se->poolBytes : 1);
   snes_init(&se->snes, se->pool, se->poolBytes, putRows, se);
-  pack_attach(pack, &se->snes);
+  se->snes.romTrace = g_romTrace;
+  if(!pack_attach(pack, &se->snes)) fprintf(stderr, "warning: not enough RAM for the table of ROM blocks\n");
   se->snes.refPpu = refPpu;
   se->snes.refCpu = refPpu; /* the reference session: LakeSnes' interpreter and renderer */
   /* ...and it never uses speed-ups */
@@ -158,7 +160,7 @@ static bool runDevice(const NsPack* pack, const Inputs* in, uint32_t frames, uin
   for(uint32_t f = 0; f < frames; f++) {
     snes_setPad(&se->snes, 0, inputAt(in, f));
     snes_runFrame(&se->snes);
-    if(se->snes.pager.oom) {
+    if(se->snes.pager.oom || se->snes.romMissing) {
       ok = false;
       if(oomFrame) *oomFrame = f;
       break;
@@ -295,8 +297,11 @@ int main(int argc, char** argv) {
   int rc = 0;
 
   if(profileOut) {
-    /* ---- profile: run with plenty of RAM, record stable pages, write a pack */
+    /* ---- profile: run with plenty of RAM, record stable pages and which
+     * parts of the ROM are read, write a pack */
+    g_romTrace = calloc(params.romSize >> NS_PAGE_SHIFT, 1);
     Session* se = sessionNew(&pack, unlimited, false);
+    params.romUsed = g_romTrace;
     NsProfiler* prof = prof_new();
     for(uint32_t f = 0; f < frames; f++) {
       snes_setPad(&se->snes, 0, inputAt(&in, f));
@@ -314,6 +319,10 @@ int main(int argc, char** argv) {
     printf("profile: %u frames, %u stable page contents (%u dropped)\n", st.framesSampled, st.candidates, st.dropped);
     printf("pack: %u bytes, dictionary %u pages (%u found in the ROM, %u stored, %u left out)\n",
            st.packBytes, st.dictEntries, st.dictInRom, st.dictStored, st.dictLeftOut);
+    if(st.romBlocksPacked < st.romBlocks) {
+      printf("pack: the ROM does not fit: %u KB of its %u KB are in the pack (%u KB read during the session)\n",
+             st.romBlocksPacked * 4, st.romBlocks * 4, st.romBlocksRead * 4);
+    }
     free(out);
     prof_free(prof);
     sessionFree(se);
@@ -345,6 +354,12 @@ int main(int argc, char** argv) {
       if(collectEach) pager_collect(&b->snes.pager);
       if(b->snes.pager.oom) {
         printf("compare: device ran out of RAM at frame %u\n", f);
+        rc = 1;
+        break;
+      }
+      if(b->snes.romMissing) {
+        printf("compare: at frame %u the game read a part of the ROM that is not in the pack (offset 0x%x)\n", f,
+               b->snes.romMissingAt);
         rc = 1;
         break;
       }
@@ -404,6 +419,11 @@ int main(int argc, char** argv) {
       if(collectEach) pager_collect(&se->snes.pager);
       if(se->snes.pager.oom) {
         printf("out of RAM at frame %u\n", f);
+        rc = 1;
+        break;
+      }
+      if(se->snes.romMissing) {
+        printf("at frame %u the game read a part of the ROM that is not in the pack (offset 0x%x)\n", f, se->snes.romMissingAt);
         rc = 1;
         break;
       }

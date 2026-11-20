@@ -39,6 +39,7 @@ void ppu_reset(Snes* s) {
   ppu->renderedLine = 0;
   ppu->palBlendKey[0] = 0xffffffffu;
   ppu->regKnown = 0;
+  ppu->wlogCount = 0;
   ppu->lutBrightness = 0xff;
   ppu->objCount = 0;
   ppu->objListDirty = true;
@@ -154,7 +155,7 @@ static uint16_t ppu_getVramRemap(const Ppu* ppu) {
 
 uint8_t ppu_read(Snes* s, uint8_t adr) {
   Ppu* ppu = &s->ppu;
-  if(adr == 0x38 || adr == 0x3e) ppu_flush(s);
+  if(ppu->wlogCount || adr == 0x38 || adr == 0x3e) ppu_flush(s);
   switch(adr) {
     case 0x04: case 0x14: case 0x24:
     case 0x05: case 0x15: case 0x25:
@@ -276,7 +277,7 @@ uint8_t ppu_read(Snes* s, uint8_t adr) {
 }
 
 /* nwsnes: what a write to each register means for the picture.
- * 0: anything (always draw the lines that are due first);
+ * 0: anything;
  * 1: the register just holds the value: writing the same one again changes nothing;
  * 2: the picture does not depend on it (video ram and palette addresses,
  *    video port control, read-only registers). */
@@ -287,19 +288,42 @@ static const uint8_t kRegKind[0x40] = {
   1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2  /* 30-3f */
 };
 
+/* nwsnes: the picture is drawn late, in one go (see ppu.c). While the
+ * visible lines go by, a write that can change the picture is not done
+ * right away: it is written down with the line it takes effect after, and
+ * ppu_flush replays the list while it draws. The game cannot tell: anything
+ * that reads the PPU flushes first (ppu_read). This is what keeps a game that
+ * changes a register on every line (HDMA) from interrupting itself 224 times
+ * per frame to draw one line. */
 void ppu_write(Snes* s, uint8_t adr, uint8_t val) {
   Ppu* ppu = &s->ppu;
   adr &= 0x3f;
-  if(!s->inVblank) {
-    /* nwsnes: the picture is drawn late. Before a register changes, the lines
-     * that are due are drawn with the old value... unless the write cannot
-     * change the picture: games that drive a register from HDMA often send
-     * the same value on every line */
-    const uint8_t kind = kRegKind[adr];
-    if(!(kind == 2 || (kind == 1 && ((ppu->regKnown >> adr) & 1) && ppu->regLast[adr] == val))) ppu_flush(s);
-  }
+  const uint8_t kind = kRegKind[adr];
+  const bool same = kind == 1 && ((ppu->regKnown >> adr) & 1) && ppu->regLast[adr] == val;
   ppu->regLast[adr] = val;
   ppu->regKnown |= 1ull << adr;
+  if(s->inVblank || !s->renderFrame || s->refPpu || s->vPos == 0) {
+    ppu_apply(s, adr, val);
+    return;
+  }
+  if(same) return; /* games driving a register from HDMA often send the same value on every line */
+  int due = snes_hPos(s) >= 512 ? s->vPos : s->vPos - 1;
+  if(due > NS_SCREEN_H_OVERSCAN) due = NS_SCREEN_H_OVERSCAN;
+  if(ppu->wlogCount == 0 && (kind == 2 || due <= ppu->renderedLine)) {
+    ppu_apply(s, adr, val); /* nothing is waiting, and no line is due before it */
+    return;
+  }
+  if(adr == 0x06) { /* mosaic: remembers the line it is written on */
+    ppu_flush(s);
+    ppu_apply(s, adr, val);
+    return;
+  }
+  if(ppu->wlogCount == NS_WLOG) ppu_flush(s);
+  ppu->wlog[ppu->wlogCount++] = ((uint32_t)due << 16) | ((uint32_t)adr << 8) | val;
+}
+
+void ppu_apply(Snes* s, uint8_t adr, uint8_t val) {
+  Ppu* ppu = &s->ppu;
   switch(adr) {
     case 0x00: {
       // TODO: oam address reset when written on first line of vblank, (and when forced blank is disabled?)

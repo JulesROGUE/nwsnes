@@ -254,6 +254,45 @@ static void findInRom(const NsProfiler* p, const uint8_t* rom, uint32_t romSize,
   free(rk);
 }
 
+void prof_seedRomUse(const uint8_t* packData, uint32_t packSize, uint8_t* romUsed, uint32_t romSize) {
+  NsPack pack;
+  if(!pack_open(packData, packSize, &pack) || !pack.blockTable || pack.info.romSize != romSize) return;
+  for(uint32_t i = 0; i < romSize >> NS_ROM_BLOCK_SHIFT; i++) {
+    if(ns_rd32(pack.blockTable + i * 4) != 0xffffffffu) memset(romUsed + i * (NS_ROM_BLOCK / NS_PAGE_SIZE), 1, NS_ROM_BLOCK / NS_PAGE_SIZE);
+  }
+}
+
+/* picks the dictionary entries that fit: best contents first, until the
+ * flash budget is used up. Returns the bytes used, fixed part included. */
+static uint32_t pickDict(const NsProfiler* p, uint32_t count, const uint32_t* order, const uint32_t* romPos, uint32_t romOff,
+                         uint32_t fixed, uint32_t maxPackBytes, DictOut* dict, uint32_t* stored, uint32_t* nDictOut,
+                         uint32_t* nStoredOut, NsPackStats* st) {
+  uint32_t nDict = 0, nStored = 0, used = fixed;
+  st->dictInRom = 0;
+  st->dictLeftOut = 0;
+  for(uint32_t i = 0; i < count; i++) {
+    uint32_t idx = order[i];
+    uint32_t cost = NS_DICT_ENTRY_SIZE + (romPos[idx] == 0xffffffffu ? NS_PAGE_SIZE : 0);
+    if(maxPackBytes && used + cost > maxPackBytes) {
+      st->dictLeftOut++;
+      continue;
+    }
+    used += cost;
+    dict[nDict].hash = p->entries[idx].hash;
+    if(romPos[idx] != 0xffffffffu) {
+      dict[nDict].offset = romOff + romPos[idx];
+      st->dictInRom++;
+    } else {
+      dict[nDict].offset = 0x80000000u | nStored; /* patched by the caller */
+      stored[nStored++] = idx;
+    }
+    nDict++;
+  }
+  *nDictOut = nDict;
+  *nStoredOut = nStored;
+  return used;
+}
+
 uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_t* outSize, NsPackStats* stats) {
   NsPackStats st;
   memset(&st, 0, sizeof(st));
@@ -262,49 +301,100 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
   st.dropped = p ? p->dropped : 0;
   uint32_t count = p ? p->count : 0;
 
-  const uint32_t romOff = NS_PACK_HEADER_SIZE;
-  uint32_t fixed = romOff + params->romSize;
+  /* The ROM goes in whole when it fits. Otherwise, and if it is known what
+   * the game reads, only those 4 KB blocks go in (version 2 of the format). */
+  const uint32_t nBlocks = params->romSize >> NS_ROM_BLOCK_SHIFT;
+  const bool blocks = params->maxPackBytes && params->romUsed && NS_PACK_HEADER_SIZE + params->romSize > params->maxPackBytes;
+  const uint32_t headerSize = blocks ? NS_PACK_HEADER_SIZE_BLOCKS : NS_PACK_HEADER_SIZE;
+  const uint32_t tableOff = headerSize;
+  const uint32_t romOff = headerSize + (blocks ? nBlocks * 4 : 0);
+  st.romBlocks = nBlocks;
+  st.romBlocksRead = nBlocks;
+  st.romBlocksPacked = nBlocks;
+
   uint32_t* order = malloc((count + 1) * sizeof(uint32_t));
   uint32_t* romPos = malloc((count + 1) * sizeof(uint32_t));
   DictOut* dict = malloc((count + 1) * sizeof(DictOut));
   uint32_t* stored = malloc((count + 1) * sizeof(uint32_t)); /* entries needing their own flash page */
-  if(!order || !romPos || !dict || !stored) {
-    free(order); free(romPos); free(dict); free(stored);
+  uint8_t* present = calloc(nBlocks + 1, 1);                  /* blocks that go in the pack */
+  uint8_t* image = blocks ? malloc(params->romSize) : NULL;   /* those blocks one after the other */
+  if(!order || !romPos || !dict || !stored || !present || (blocks && !image)) {
+    free(order); free(romPos); free(dict); free(stored); free(present); free(image);
     return NULL;
   }
-  uint32_t nDict = 0, nStored = 0;
+  if(blocks) {
+    st.romBlocksRead = 0;
+    for(uint32_t i = 0; i < nBlocks; i++) {
+      for(uint32_t j = 0; j < NS_ROM_BLOCK / NS_PAGE_SIZE; j++) present[i] |= params->romUsed[i * (NS_ROM_BLOCK / NS_PAGE_SIZE) + j];
+      present[i] = present[i] != 0;
+      st.romBlocksRead += present[i];
+    }
+  } else {
+    memset(present, 1, nBlocks);
+  }
+  for(uint32_t i = 0; i < count; i++) order[i] = i;
   if(count) {
-    findInRom(p, params->rom, params->romSize, romPos);
-    for(uint32_t i = 0; i < count; i++) order[i] = i;
     g_sortProf = p;
     qsort(order, count, sizeof(uint32_t), byWeightDesc);
-    /* best contents first, until the flash budget is used up */
-    uint32_t used = fixed;
-    for(uint32_t i = 0; i < count; i++) {
-      uint32_t idx = order[i];
-      uint32_t cost = NS_DICT_ENTRY_SIZE + (romPos[idx] == 0xffffffffu ? NS_PAGE_SIZE : 0);
-      if(params->maxPackBytes && used + cost > params->maxPackBytes) {
-        st.dictLeftOut++;
-        continue;
-      }
-      used += cost;
-      dict[nDict].hash = p->entries[idx].hash;
-      if(romPos[idx] != 0xffffffffu) {
-        dict[nDict].offset = romOff + romPos[idx];
-        st.dictInRom++;
-      } else {
-        dict[nDict].offset = 0x80000000u | nStored; /* patched below */
-        stored[nStored++] = idx;
-      }
-      nDict++;
-    }
   }
+
+  uint32_t nDict = 0, nStored = 0, imageSize = 0;
+  const uint8_t* romData = params->rom;
+  for(int pass = 0; pass < (blocks ? 2 : 1); pass++) {
+    if(blocks) {
+      imageSize = 0;
+      for(uint32_t i = 0; i < nBlocks; i++) {
+        if(!present[i]) continue;
+        memcpy(image + imageSize, params->rom + ((size_t)i << NS_ROM_BLOCK_SHIFT), NS_ROM_BLOCK);
+        imageSize += NS_ROM_BLOCK;
+      }
+      romData = image;
+    } else {
+      imageSize = params->romSize;
+    }
+    for(uint32_t i = 0; i < count; i++) romPos[i] = 0xffffffffu;
+    if(count && imageSize >= NS_PAGE_SIZE) findInRom(p, romData, imageSize, romPos);
+    const uint32_t used = pickDict(p, count, order, romPos, romOff, romOff + imageSize, params->maxPackBytes, dict, stored,
+                                   &nDict, &nStored, &st);
+    if(!blocks || pass == 1) break;
+    /* Room left once everything known is in: use it for the blocks next to
+     * the ones the game read. A game played on the calculator never does
+     * exactly what it did on the PC, and what it reads instead is usually
+     * close by (another frame of an animation, the next entry of a table). */
+    uint32_t extra = used < params->maxPackBytes ? (params->maxPackBytes - used) / NS_ROM_BLOCK : 0;
+    if(extra == 0 || st.romBlocksRead == 0) break;
+    uint32_t* dist = malloc(nBlocks * sizeof(uint32_t));
+    if(!dist) break;
+    uint32_t d = 0xffffffffu;
+    for(uint32_t i = 0; i < nBlocks; i++) {
+      d = present[i] ? 0 : (d == 0xffffffffu ? d : d + 1);
+      dist[i] = d;
+    }
+    d = 0xffffffffu;
+    for(uint32_t i = nBlocks; i-- > 0;) {
+      d = present[i] ? 0 : (d == 0xffffffffu ? d : d + 1);
+      if(d < dist[i]) dist[i] = d;
+    }
+    for(uint32_t want = 1; extra > 0 && want < nBlocks; want++) {
+      for(uint32_t i = 0; i < nBlocks && extra > 0; i++) {
+        if(dist[i] == want) {
+          present[i] = 1;
+          extra--;
+        }
+      }
+    }
+    free(dist);
+  }
+  st.romBlocksPacked = 0;
+  for(uint32_t i = 0; i < nBlocks; i++) st.romBlocksPacked += present[i];
+
+  const uint32_t fixed = romOff + imageSize;
   uint32_t dictOff = fixed;
   uint32_t dataOff = dictOff + nDict * NS_DICT_ENTRY_SIZE;
   uint32_t total = dataOff + nStored * NS_PAGE_SIZE;
   uint8_t* pack = calloc(1, total);
   if(!pack) {
-    free(order); free(romPos); free(dict); free(stored);
+    free(order); free(romPos); free(dict); free(stored); free(present); free(image);
     return NULL;
   }
   for(uint32_t i = 0; i < nDict; i++) {
@@ -313,8 +403,8 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
   qsort(dict, nDict, sizeof(DictOut), byHash);
 
   memcpy(pack, NS_PACK_MAGIC, 8);
-  wr32(pack + 8, NS_PACK_VERSION);
-  wr32(pack + 12, NS_PACK_HEADER_SIZE);
+  wr32(pack + 8, blocks ? NS_PACK_VERSION_BLOCKS : NS_PACK_VERSION);
+  wr32(pack + 12, headerSize);
   wr32(pack + 16, total);
   wr32(pack + 20, romOff);
   wr32(pack + 24, params->romSize);
@@ -325,12 +415,22 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
   pack[41] = params->pal ? 1 : 0;
   pack[42] = params->apuMode;
   pack[43] = params->frameSkip;
-  wr32(pack + 44, 0);
+  wr32(pack + 44, blocks && st.romBlocksPacked < nBlocks ? NS_PACK_FLAG_PARTIAL : 0);
   if(params->title) {
     size_t n = strlen(params->title);
     memcpy(pack + 48, params->title, n > 16 ? 16 : n);
   }
-  memcpy(pack + romOff, params->rom, params->romSize);
+  if(blocks) {
+    wr32(pack + 64, tableOff);
+    wr32(pack + 68, nBlocks);
+    wr32(pack + 72, st.romBlocksPacked);
+    uint32_t off = romOff;
+    for(uint32_t i = 0; i < nBlocks; i++) {
+      wr32(pack + tableOff + i * 4, present[i] ? off : 0xffffffffu);
+      if(present[i]) off += NS_ROM_BLOCK;
+    }
+  }
+  memcpy(pack + romOff, romData, imageSize);
   for(uint32_t i = 0; i < nDict; i++) {
     wr32(pack + dictOff + i * NS_DICT_ENTRY_SIZE, dict[i].hash);
     wr32(pack + dictOff + i * NS_DICT_ENTRY_SIZE + 4, dict[i].offset);
@@ -343,6 +443,6 @@ uint8_t* prof_buildPack(const NsProfiler* p, const NsPackParams* params, uint32_
   st.packBytes = total;
   if(stats) *stats = st;
   *outSize = total;
-  free(order); free(romPos); free(dict); free(stored);
+  free(order); free(romPos); free(dict); free(stored); free(present); free(image);
   return pack;
 }

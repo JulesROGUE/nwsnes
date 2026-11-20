@@ -5,8 +5,10 @@
  * straight into a small RGB565 buffer that is handed to the display.
  *
  * It is also drawn late. Nothing is done when a scanline goes by; the lines
- * are drawn in one go when something they depend on is about to change (a
- * write to a PPU register, see ppu_flush) or when the frame ends. That way
+ * are drawn in one go when the frame ends, or earlier when the game reads
+ * something back from the PPU. Register writes made in the meantime are
+ * written down and replayed between the lines they separate (ppu_write in
+ * ppu_regs.c, ppu_flush here). That way
  * the renderer and the cpu core run one after the other instead of taking
  * turns 224 times per frame, which matters on a processor with an 8 KB
  * instruction cache.
@@ -1133,6 +1135,21 @@ static void renderLines(Snes* s, int first, int last) {
  * when vertical blanking starts. */
 void ppu_flush(Snes* s) {
   Ppu* ppu = &s->ppu;
+  /* the register writes that were waiting, each after the lines before it */
+  if(ppu->wlogCount) {
+    const unsigned n = ppu->wlogCount;
+    ppu->wlogCount = 0;
+    for(unsigned i = 0; i < n; i++) {
+      const uint32_t e = ppu->wlog[i];
+      const int line = (int)(e >> 16);
+      if(line > ppu->renderedLine) {
+        const int first = ppu->renderedLine + 1;
+        ppu->renderedLine = (uint8_t)line;
+        renderLines(s, first, line);
+      }
+      ppu_apply(s, (uint8_t)(e >> 8), (uint8_t)e);
+    }
+  }
   if(s->inVblank || !s->renderFrame || s->refPpu || s->vPos == 0) return;
   int due = snes_hPos(s) >= 512 ? s->vPos : s->vPos - 1;
   if(due > NS_SCREEN_H_OVERSCAN) due = NS_SCREEN_H_OVERSCAN;
