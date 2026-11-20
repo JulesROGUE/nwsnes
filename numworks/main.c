@@ -148,16 +148,25 @@ int main(int argc, char* argv[]) {
   pack_attach(&pack, &snes);
   snes_reset(&snes, true);
 
-  text(0, "nwsnes");
+  /* start screen. It stays up until a key is pressed so the RAM figure can
+   * be read: it is the number snes2nw needs (--ram-kb) to give a verdict. */
+  text(0, "nwsnes 0.1");
   text(1, pack.title);
-  char* p = putStr(buf, "RAM: ");
-  p = putNum(p, snes.pager.poolPages / 4);
-  p = putStr(p, " Ko, dico: ");
-  p = putNum(p, pack.dictCount);
-  putStr(p, " p.");
+  char* p = putStr(buf, "RAM totale: ");
+  p = putNum(p, (poolBytes + 8192) / 1024);
+  putStr(p, " Ko");
   text(3, buf);
-  text(5, "0: stats   Home: quitter");
-  eadk_timing_msleep(1500);
+  p = putStr(buf, "RAM pour le jeu: ");
+  p = putNum(p, snes.pager.poolPages / 4);
+  putStr(p, " Ko");
+  text(4, buf);
+  p = putStr(buf, "Dictionnaire: ");
+  p = putNum(p, pack.dictCount);
+  putStr(p, " pages");
+  text(5, buf);
+  text(7, "0: stats   Maison: quitter");
+  text(9, "Appuyez sur OK");
+  waitKey();
   eadk_display_push_rect_uniform(eadk_screen_rect, eadk_color_black);
 
   const uint32_t frameUs = pack.info.pal ? 20000 : 16667;

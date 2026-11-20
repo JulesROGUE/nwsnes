@@ -87,6 +87,9 @@ eadk_keyboard_state_t eadk_keyboard_scan(void) {
   loops++;
   if(loops >= maxLoops) finish();
   eadk_keyboard_state_t keys = 0;
+  /* the start screen waits for a key press and release */
+  static int startKey;
+  if(startKey < 6) return (startKey++ >= 2 && startKey <= 5) ? (eadk_keyboard_state_t)1 << eadk_key_ok : 0;
   if(loops >= 5 && loops < 8) keys |= (eadk_keyboard_state_t)1 << eadk_key_zero; /* statistics on */
   if(loops >= 60 && (loops / 40) % 2) keys |= (eadk_keyboard_state_t)1 << eadk_key_right;
   if(loops >= 200) keys |= (eadk_keyboard_state_t)1 << eadk_key_back; /* SNES A */

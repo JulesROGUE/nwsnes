@@ -1,8 +1,9 @@
 #!/bin/sh
 # Compares nwsnes with a reference emulator binary, frame by frame.
 # usage: crosscheck.sh <reference-binary> <rom dir> [frames] [seed] [extra nwsnes-host options]
-# The reference binary must print one "f<frame> <hash>" line per frame
-# (see docs/TESTING.md for the 40-line LakeSnes driver used during development).
+# The reference binary must print one "f<frame> <hash>" line per frame:
+# tools/lakesnes_ref.c does that for the unmodified LakeSnes (build
+# instructions at the top of that file).
 REF=$1; DIR=$2; FRAMES=${3:-300}; SEED=${4:-7}; shift 4 2>/dev/null
 HOST=$(dirname "$0")/../build/nwsnes-host
 same=0; total=0
