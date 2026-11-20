@@ -2,11 +2,11 @@
 
 Un cœur d'émulateur SNES taillé pour la calculatrice **NumWorks** (appli externe `.nwa`), dont la mémoire vive ne suffit normalement pas : une SNES utilise 192 Ko pour sa mémoire de travail et sa mémoire vidéo, une appli NumWorks en reçoit 149 au total.
 
-> **État : version 0.3, expérimentale.** L'appli tourne sur une vraie N0110 (système 25.2.0) : la version 0.1 y faisait tourner Super Mario World à 43 % de sa vitesse, avec 7 images affichées par seconde. Le cœur a été réécrit depuis pour le petit cache de la calculatrice (0.2) ; d'après le banc d'essai le même jeu devrait approcher sa vitesse normale, mais **ce n'est pas encore mesuré sur calculatrice**. L'installation en deux parties des jeux de plus de 2,5 Mo (0.3) n'a **pas encore été essayée sur une calculatrice** non plus : sur PC seulement, contre une calculatrice simulée.
+> **État : version 0.3, expérimentale.** L'appli tourne sur une vraie N0110 (système 25.2.0). La version 0.1 y faisait tourner Super Mario World à 43 % de sa vitesse, avec 7 images affichées par seconde ; le cœur a été réécrit depuis pour le petit cache de la calculatrice. Avec la version 0.3, un jeu de plus de 2,5 Mo installé en deux parties (2556 Ko dans l'autre moitié de la flash) y a été mesuré à 99 % de sa vitesse, 39 images affichées par seconde. C'est **une seule mesure, sur une seule calculatrice** : rien n'est connu des autres modèles ni des autres versions du système.
 
 L'outil PC qui prépare un jeu et l'installe est dans un dépôt séparé : **snes2nw**.
 
-*English summary: a SNES emulator core for the NumWorks calculator. It fits by never emulating audio and by backing emulated RAM with flash pages found by profiling the game on a PC ("content-addressed paging"). Games bigger than the app area of the flash are split over the app areas of both firmware slots. Runs on a real N0110; speed of the current version and the two-slot installation are verified on PC only so far.*
+*English summary: a SNES emulator core for the NumWorks calculator. It fits by never emulating audio and by backing emulated RAM with flash pages found by profiling the game on a PC ("content-addressed paging"). Games bigger than the app area of the flash are split over the app areas of both firmware slots. Runs on a real N0110 (one unit, system 25.2.0), two-slot installation included.*
 
 ## Comment ça tient
 
@@ -29,7 +29,8 @@ Mesuré avec les applis `make diag` et `make probe` :
 |---|---|
 | RAM laissée aux applis externes | 149 Ko |
 | Zone des applis en flash | 2560 Ko dans chacune des deux moitiés |
-| L'autre moitié de la flash | lisible par une appli |
+| L'autre moitié de la flash | lisible par une appli ; sa zone d'applis est inscriptible par USB |
+| Jeu en deux parties, version 0.3 | 99 % de sa vitesse, 39 images affichées par seconde (une mesure) |
 | Accès à la flash hors du cache | environ 0,95 µs |
 | Accès à la RAM hors du cache | environ 33 ns |
 | Caches du processeur | 8 Ko pour le code, 8 Ko pour les données |
@@ -68,11 +69,11 @@ Vitesse, en instructions ARM par image (code de l'appli exécuté sur un Cortex-
 | Super Mario World | 2,0 millions | 0,8 million |
 | Donkey Kong Country | 4,4 millions | 1,1 million |
 
-Le temps réel dépend surtout des accès à la flash qui manquent le cache, que QEMU ne connaît pas : le banc d'essai les compte avec un modèle du cache (`CACHESIM`). Avec les temps mesurés sur la calculatrice, ce modèle donne environ 15 ms par image pour Super Mario World en dessinant une image sur deux (la vitesse normale, à 30 images affichées par seconde) et 24 ms pour Donkey Kong Country en dessinant une image sur trois (70 à 80 % de sa vitesse). **Ce modèle n'a pas encore été confronté à la calculatrice.**
+Le temps réel dépend surtout des accès à la flash qui manquent le cache, que QEMU ne connaît pas : le banc d'essai les compte avec un modèle du cache (`CACHESIM`). Avec les temps mesurés sur la calculatrice, ce modèle donne environ 15 ms par image pour Super Mario World en dessinant une image sur deux (la vitesse normale, à 30 images affichées par seconde) et 24 ms pour Donkey Kong Country en dessinant une image sur trois (70 à 80 % de sa vitesse). La seule mesure faite sur calculatrice avec cette version (99 %, 39 images par seconde) est meilleure que ce modèle ; elle n'a pas été faite dans les conditions du banc d'essai, et le modèle reste à confronter proprement.
 
 ## Limites connues
 
-- **La vitesse de la version actuelle n'est pas mesurée sur calculatrice**, et l'installation en deux parties n'y a jamais été essayée : il se peut que la calculatrice refuse l'écriture dans son autre moitié (`snes2nw` s'arrête alors sans rien modifier).
+- **Tout ce qui est mesuré sur calculatrice l'est sur une seule N0110, système 25.2.0.** Un autre modèle ou une autre version peut refuser l'écriture dans son autre moitié (`snes2nw` s'arrête alors sans rien modifier), et la vitesse n'y a été relevée qu'une fois.
 - **Un jeu en deux parties ne survit pas à une mise à jour de la calculatrice** : elle écrit dans la moitié de secours. Il suffit de le réinstaller.
 - **Il faut avoir joué le passage sur PC.** Un passage jamais vu pendant la préparation peut demander plus de RAM qu'il n'y en a ; l'appli s'arrête alors avec un message.
 - Un jeu de plus de 5 Mo environ ne tient pas en entier : seule la partie de sa ROM lue pendant la préparation est installée.

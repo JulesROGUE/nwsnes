@@ -64,7 +64,7 @@ Ce qui est établi et ce qui ne l'est pas :
 
 - une appli peut lire l'autre moitié : vérifié sur calculatrice (`make probe`) ;
 - le système déclare par USB toute l'autre moitié comme lisible, effaçable et inscriptible : c'est écrit dans son code source publié (c'est par là que passent les mises à jour) ;
-- que le noyau, dont le source n'est pas publié, laisse réellement écrire dans la zone d'applis de l'autre moitié : **pas encore essayé**. Si la calculatrice refuse, elle le signale, et l'installation s'arrête avant d'avoir touché aux applis en place.
+- le noyau, dont le source n'est pas publié, laisse réellement écrire dans la zone d'applis de l'autre moitié : vérifié sur une N0110 (système 25.2.0, qui tournait dans la première moitié), où 2556 Ko ont été écrits, relus à l'identique, puis retrouvés par l'appli. Rien n'est connu des autres modèles et versions : si une calculatrice refuse, elle le signale, et l'installation s'arrête avant d'avoir touché aux applis en place.
 
 ## Minutage et processeur (`core/snes.c`, `core/cpu.c`)
 
@@ -101,9 +101,9 @@ C'est le point le plus fragile face aux jeux du commerce.
 
 Couvert, sur PC : identité du cœur rapide et de la référence (processeur, rendu, mémoire octet pour octet) sur 91 ROM de test et sur des sessions de trois jeux du commerce ; comparaison avec LakeSnes non modifié ; robustesse aux packs abîmés ; logique de cadence de l'appli avec une horloge simulée ; édition de liens de l'appli par `nwlink` ; installation en deux parties contre une calculatrice simulée, y compris quand elle refuse ou ignore l'écriture (tests de snes2nw).
 
-Couvert, sur calculatrice : l'appli démarre et fait tourner un jeu du commerce (version 0.1) ; tailles de la RAM et des zones d'applis ; vitesse de la flash et de la RAM ; lecture de l'autre moitié de la flash.
+Couvert, sur une calculatrice (N0110, système 25.2.0) : l'appli démarre et fait tourner des jeux du commerce ; tailles de la RAM et des zones d'applis ; vitesse de la flash et de la RAM ; lecture et écriture de l'autre moitié de la flash ; un jeu en deux parties, mesuré une fois à 99 % de sa vitesse.
 
-Non couvert : la vitesse de la version actuelle sur calculatrice (seulement un modèle, à partir du nombre d'instructions et d'accès manqués au cache) ; l'écriture dans l'autre moitié de la flash.
+Non couvert : les autres modèles et les autres versions du système ; une mesure de vitesse dans les conditions du banc d'essai, pour confronter le modèle (nombre d'instructions et d'accès manqués au cache).
 
 ## Pistes
 
