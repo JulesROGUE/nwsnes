@@ -1,25 +1,33 @@
 /*
- * nwsnes - line renderer
+ * nwsnes - renderer
  *
- * Draws one scanline at a time straight into a 256-pixel RGB565 buffer that
- * is handed to the display: there is no frame buffer anywhere.
+ * There is no frame buffer: the picture is drawn in bands of NS_BAND lines
+ * straight into a small RGB565 buffer that is handed to the display.
  *
- * Every layer writes into a "z-buffer" line where each pixel holds
- *   bits 15-12  priority level (higher wins)
- *   bits 11-8   layer code: 0-3 backgrounds, 4 sprites taking part in colour
- *               math, 6 sprites that do not, 5 backdrop
- *   bits 7-0    palette index
- * so layers can be drawn in any order, then one pass turns the winners into
- * colours (with colour math against the sub screen when the game uses it).
+ * It is also drawn late. Nothing is done when a scanline goes by; the lines
+ * are drawn in one go when something they depend on is about to change (a
+ * write to a PPU register, see ppu_flush) or when the frame ends. That way
+ * the renderer and the cpu core run one after the other instead of taking
+ * turns 224 times per frame, which matters on a processor with an 8 KB
+ * instruction cache.
  *
- * The priority tables, the pixel-exact slow paths (mosaic, offset-per-tile,
+ * Two renderers share the job:
+ *
+ *  - the fast path paints the layers of a band from back to front, tile by
+ *    tile, directly as colours. It handles what games do most of the time:
+ *    modes 0 and 1, 8x8 tiles, no window in use, no mosaic, and colour math
+ *    limited to a fixed colour or to the backdrop;
+ *  - everything else goes line by line through the general renderer, which
+ *    keeps for every pixel its priority and layer (a "z-buffer" line) and
+ *    resolves windows and colour math per pixel.
+ *
+ * The priority tables, the pixel-exact paths (mosaic, offset-per-tile,
  * hi-res) and the general semantics come from LakeSnes (c) 2021-2023
  * angelo_wf and contributors, MIT license; the z-buffer idea follows the
  * snesrev renderer (c) 2021-2023 snesrev / elzo_d, MIT license. Output is
  * checked against LakeSnes' renderer (ppu_ref.c) by the host tests.
  *
- * Not handled by the fast renderer: direct colour, and 512-pixel modes are
- * shown at 256 pixels.
+ * Not handled: direct colour, and 512-pixel modes are shown at 256 pixels.
  */
 #include <string.h>
 
@@ -191,6 +199,13 @@ static void getSpans(const Ppu* ppu, int layer, bool windowed, Spans* sp) {
   for(int i = 0; i < n; i++) {
     if(windowState(ppu, layer, sp->edge[i])) sp->masked |= (uint8_t)(1 << i);
   }
+}
+
+/* true when the whole line is on the same side of the windows; *hidden tells which */
+static bool spansUniform(const Spans* sp, bool* hidden) {
+  const uint32_t all = (1u << sp->n) - 1;
+  *hidden = sp->masked != 0;
+  return sp->masked == 0 || sp->masked == all;
 }
 
 /* ------------------------------------------------------ backgrounds -- */
@@ -375,6 +390,10 @@ static void drawBgSlow(Snes* s, int y, bool sub, uint16_t* dst, int layer, int b
   const Ppu* ppu = &s->ppu;
   const BgLayer* bg = &ppu->bgLayer[layer];
   const bool mosaic = bg->mosaicEnabled && ppu->mosaicSize > 1;
+  /* with mosaic, neighbouring pixels show the same source pixel: fetch it once */
+  int lastLx = -1;
+  int pixel = 0;
+  bool prio = false;
   for(int i = 0; i < sp->n; i++) {
     if(sp->masked & (1 << i)) continue;
     for(int x = sp->edge[i]; x < sp->edge[i + 1]; x++) {
@@ -384,19 +403,21 @@ static void drawBgSlow(Snes* s, int y, bool sub, uint16_t* dst, int layer, int b
         lx -= lx % ppu->mosaicSize;
         ly -= (ly - ppu->mosaicStartLine) % ppu->mosaicSize;
       }
-      lx += bg->hScroll;
-      if(ppu->mode == 5 || ppu->mode == 6) {
-        lx *= 2;
-        lx += (sub || bg->mosaicEnabled) ? 0 : 1;
-        if(ppu->interlace) {
-          ly *= 2;
-          ly += (ppu->evenFrame || bg->mosaicEnabled) ? 0 : 1;
+      if(lx != lastLx) {
+        lastLx = lx;
+        lx += bg->hScroll;
+        if(ppu->mode == 5 || ppu->mode == 6) {
+          lx *= 2;
+          lx += (sub || bg->mosaicEnabled) ? 0 : 1;
+          if(ppu->interlace) {
+            ly *= 2;
+            ly += (ppu->evenFrame || bg->mosaicEnabled) ? 0 : 1;
+          }
         }
+        ly += bg->vScroll;
+        if(ppu->mode == 2 || ppu->mode == 4 || ppu->mode == 6) handleOPT(s, layer, &lx, &ly);
+        pixel = bgPixel(s, lx & 0x3ff, ly & 0x3ff, layer, bpp, &prio);
       }
-      ly += bg->vScroll;
-      if(ppu->mode == 2 || ppu->mode == 4 || ppu->mode == 6) handleOPT(s, layer, &lx, &ly);
-      bool prio;
-      int pixel = bgPixel(s, lx & 0x3ff, ly & 0x3ff, layer, bpp, &prio);
       if(pixel) {
         uint16_t z = lv->bg[layer][prio];
         if(z > dst[x]) dst[x] = (uint16_t)(z | pixel);
@@ -468,13 +489,14 @@ static void drawMode7(Snes* s, uint16_t* dst, int layer, const Levels* lv, const
 
 /* ----------------------------------------------------------- sprites -- */
 
-/* Fills objBuf for one line. Same selection rules as LakeSnes: at most 32
- * sprites and 34 tile slivers per line, later sprites are dropped first. */
-/* lists the sprites that are on screen on at least one line */
-static void buildObjList(Ppu* ppu) {
+#define OBJ_PIXEL 0x8000u
+
+/* Lists the sprites that are on screen on at least one line, in the order
+ * the hardware scans them (from "start", wrapping around). */
+static void buildObjList(Ppu* ppu, uint8_t start) {
   int n = 0;
-  for(int i = 0; i < 128; i++) {
-    const int index = i * 2;
+  uint8_t index = start;
+  for(int i = 0; i < 128; i++, index = (uint8_t)(index + 2)) {
     const int y = ppu->oam[index] >> 8;
     const int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
     const int spriteHeight = ppu->objInterlace ? spriteSize / 2 : spriteSize;
@@ -484,25 +506,41 @@ static void buildObjList(Ppu* ppu) {
     x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
     if(x > 255) x -= 512;
     if(x <= -spriteSize) continue;
-    ppu->objList[n++] = (uint8_t)index;
+    ppu->objList[n++] = index;
   }
   ppu->objCount = (uint8_t)n;
+  ppu->objListStart = start;
   ppu->objListDirty = false;
 }
 
-static bool evaluateSprites(Snes* s, int line, const Levels* lv) {
+/* Fills row r of the band with the sprite pixels of one line. Same selection
+ * rules as LakeSnes: at most 32 sprites and 34 tiles per line, later sprites
+ * are dropped first, and among sprites the first one in the scan wins
+ * whatever its priority. */
+static void evalSprites(Snes* s, int line, int r) {
   Ppu* ppu = &s->ppu;
-  /* with priority rotation the scan starts anywhere: take the long road */
-  const bool rotate = ppu->objPriority;
-  if(!rotate && ppu->objListDirty) buildObjList(ppu);
-  const int scanCount = rotate ? 128 : ppu->objCount;
-  uint8_t index = rotate ? (ppu->oamAdr & 0xfe) : 0;
+  uint16_t* buf = ppu->objRow[r];
+  /* erase what the last use of this row left */
+  for(int i = 0; i < ppu->objSlivers[r]; i++) {
+    int x = ppu->objSliverX[r][i];
+    int n = 8;
+    if(x < 0) {
+      n += x;
+      x = 0;
+    }
+    if(x + n > NS_SCREEN_W) n = NS_SCREEN_W - x;
+    memset(buf + x, 0, (size_t)n * sizeof(uint16_t));
+  }
+  int slivers = 0;
+  uint32_t prioMask = 0;
+  /* with priority rotation the scan starts at the sprite OAM points to */
+  const uint8_t start = ppu->objPriority ? (ppu->oamAdr & 0xfe) : 0;
+  if(ppu->objListDirty || start != ppu->objListStart) buildObjList(ppu, start);
   int spritesFound = 0;
   int tilesFound = 0;
-  bool any = false;
   uint8_t foundSprites[32];
-  for(int i = 0; i < scanCount; i++) {
-    if(!rotate) index = ppu->objList[i];
+  for(int i = 0; i < ppu->objCount; i++) {
+    const uint8_t index = ppu->objList[i];
     uint8_t y = (uint8_t)(ppu->oam[index] >> 8);
     uint8_t row = (uint8_t)(line - y);
     int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
@@ -521,11 +559,10 @@ static bool evaluateSprites(Snes* s, int line, const Levels* lv) {
         foundSprites[spritesFound - 1] = index;
       }
     }
-    index += 2;
   }
   /* iterate over found sprites backwards to fetch max 34 tile slivers */
   for(int i = spritesFound; i > 0; i--) {
-    index = foundSprites[i - 1];
+    const uint8_t index = foundSprites[i - 1];
     uint8_t y = (uint8_t)(ppu->oam[index] >> 8);
     uint8_t row = (uint8_t)(line - y);
     int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
@@ -538,9 +575,8 @@ static bool evaluateSprites(Snes* s, int line, const Levels* lv) {
     const int tile = attr & 0xff;
     const bool hFlipped = attr & 0x4000;
     if(attr & 0x8000) row = (uint8_t)(spriteSize - 1 - row);
-    const uint32_t color = 0x80u + 16u * ((attr & 0xe00) >> 9);
-    /* palettes 4-7 take part in colour math, 0-3 do not */
-    const uint16_t z = (uint16_t)(lv->obj[(attr & 0x3000) >> 12] | ((color >= 0xc0 ? LAYER_OBJ : LAYER_OBJ_NOMATH) << 8));
+    const uint32_t prio = (attr & 0x3000) >> 12;
+    const uint32_t value = OBJ_PIXEL | (prio << 8) | (0x80u + 16u * ((attr & 0xe00) >> 9));
     const uint32_t objAdr = (attr & 0x100) ? ppu->objTileAdr2 : ppu->objTileAdr1;
     for(int col = 0; col < spriteSize; col += 8) {
       if(col + x > -8 && col + x < 256) {
@@ -557,38 +593,44 @@ static bool evaluateSprites(Snes* s, int line, const Levels* lv) {
         if(expandRow(data, row & 7, 4, hFlipped, px)) {
           int from = col + x < 0 ? -(col + x) : 0;
           int to = col + x > 248 ? 256 - (col + x) : 8;
-          if(col + x + from < ppu->objMinX) ppu->objMinX = (uint16_t)(col + x + from);
-          if(col + x + to > ppu->objMaxX) ppu->objMaxX = (uint16_t)(col + x + to);
+          ppu->objSliverX[r][slivers++] = (int16_t)(col + x);
+          prioMask |= 1u << prio;
           for(int k = from; k < to; k++) {
-            if(px[k]) {
-              ppu->objBuf[col + x + k] = (uint16_t)(z | (color + px[k]));
-              any = true;
-            }
+            if(px[k]) buf[col + x + k] = (uint16_t)(value + px[k]);
           }
         }
       }
     }
     if(tilesFound > 34) break;
   }
-  return any;
+  ppu->objSlivers[r] = (uint8_t)slivers;
+  ppu->objPrioMask[r] = (uint8_t)prioMask;
 }
 
-static void mergeSprites(const Ppu* ppu, uint16_t* dst, const Spans* sp) {
+/* general renderer: sprites of row r into a z-buffer line */
+static void mergeSprites(const Ppu* ppu, uint16_t* dst, const Spans* sp, const Levels* lv, int r) {
+  const uint16_t* buf = ppu->objRow[r];
   for(int i = 0; i < sp->n; i++) {
     if(sp->masked & (1 << i)) continue;
-    /* only the columns sprites were drawn in */
-    int x = sp->edge[i] > ppu->objMinX ? sp->edge[i] : ppu->objMinX;
-    const int end = sp->edge[i + 1] < ppu->objMaxX ? sp->edge[i + 1] : ppu->objMaxX;
-    for(; x < end; x++) {
-      uint16_t o = ppu->objBuf[x];
-      if(o > dst[x]) dst[x] = o;
+    for(int t = 0; t < ppu->objSlivers[r]; t++) {
+      int x = ppu->objSliverX[r][t];
+      int end = x + 8;
+      if(x < sp->edge[i]) x = sp->edge[i];
+      if(end > sp->edge[i + 1]) end = sp->edge[i + 1];
+      for(; x < end; x++) {
+        const uint32_t o = buf[x];
+        if(!o) continue;
+        /* palettes 4-7 take part in colour math, 0-3 do not */
+        const uint16_t z = (uint16_t)(lv->obj[(o >> 8) & 3] | (((o & 0xc0) == 0xc0 ? LAYER_OBJ : LAYER_OBJ_NOMATH) << 8) | (o & 0xff));
+        if(z > dst[x]) dst[x] = z;
+      }
     }
   }
 }
 
-/* ------------------------------------------------------- composition -- */
+/* ------------------------------------------- general renderer, a line -- */
 
-static void drawScreen(Snes* s, int y, bool sub, const Levels* lv) {
+static void drawScreen(Snes* s, int y, bool sub, const Levels* lv, int r) {
   Ppu* ppu = &s->ppu;
   uint16_t* dst = ppu->zbuf[sub];
   for(int x = 0; x < NS_SCREEN_W; x++) dst[x] = Z_BACKDROP;
@@ -607,58 +649,62 @@ static void drawScreen(Snes* s, int y, bool sub, const Levels* lv) {
       drawBg(s, y, dst, layer, bpp, lv, &sp);
     }
   }
-  if(ppu->objBufDirty) {
+  if(ppu->objSlivers[r]) {
     const Layer* l = &ppu->layer[4];
     if(sub ? l->subScreenEnabled : l->mainScreenEnabled) {
       getSpans(ppu, 4, sub ? l->subScreenWindowed : l->mainScreenWindowed, &sp);
-      mergeSprites(ppu, dst, &sp);
+      mergeSprites(ppu, dst, &sp, lv, r);
     }
   }
 }
 
-void ppu_runLine(Snes* s, int line) {
+/* colour math of one pixel: c is the main screen colour (or black when
+ * clipped), c2 what it is mixed with; both and the result are 15-bit BGR */
+static inline uint16_t blend565(const Ppu* ppu, uint32_t c, uint32_t c2, bool half) {
+  int r = (int)(c & 0x1f), g = (int)((c >> 5) & 0x1f), b = (int)((c >> 10) & 0x1f);
+  const int r2 = (int)(c2 & 0x1f), g2 = (int)((c2 >> 5) & 0x1f), b2 = (int)((c2 >> 10) & 0x1f);
+  if(ppu->subtractColor) {
+    r -= r2; g -= g2; b -= b2;
+  } else {
+    r += r2; g += g2; b += b2;
+  }
+  if(half) {
+    r >>= 1; g >>= 1; b >>= 1;
+  }
+  if(r > 31) r = 31;
+  if(g > 31) g = 31;
+  if(b > 31) b = 31;
+  if(r < 0) r = 0;
+  if(g < 0) g = 0;
+  if(b < 0) b = 0;
+  return (uint16_t)((ppu->lut5[r] << 11) | (ppu->lut6[g] << 5) | ppu->lut5[b]);
+}
+
+static inline uint32_t fixedColor(const Ppu* ppu) {
+  return (uint32_t)(ppu->fixedColorR | (ppu->fixedColorG << 5) | (ppu->fixedColorB << 10));
+}
+
+/* line: 1..224/239; r: its row in the band; out: 256 pixels */
+static void slowLine(Snes* s, int line, int r, uint16_t* out) {
   Ppu* ppu = &s->ppu;
-#ifdef NS_WITH_REFERENCE
-  if(s->refPpu) {
-    ppu_refRunLine(s, line);
-    return;
-  }
-#endif
-  uint16_t* out = ppu->line;
-  if(ppu->forcedBlank) {
-    memset(out, 0, sizeof(ppu->line));
-    s->putLine(s->user, line - 1, out);
-    return;
-  }
-  ppu_buildLuts(ppu);
   Levels lv;
   getLevels(ppu, &lv);
-  if(ppu->objBufDirty) {
-    if(ppu->objMaxX > ppu->objMinX) {
-      memset(ppu->objBuf + ppu->objMinX, 0, (size_t)(ppu->objMaxX - ppu->objMinX) * sizeof(uint16_t));
-    }
-    ppu->objBufDirty = false;
-  }
-  ppu->objMinX = NS_SCREEN_W;
-  ppu->objMaxX = 0;
-  if(evaluateSprites(s, line - 1, &lv)) ppu->objBufDirty = true;
   if(ppu->mode == 7) calculateMode7Starts(ppu, line);
 
-  drawScreen(s, line, false, &lv);
+  drawScreen(s, line, false, &lv, r);
 
   /* which layer codes take part in colour math (code 6, sprites with a
    * palette below 4, never does) */
   uint32_t mathMask = 0;
   for(int i = 0; i < 6; i++) mathMask |= (uint32_t)ppu->mathEnabled[i] << i;
   const bool useSub = mathMask && ppu->addSubscreen && ppu->preventMathMode != 3;
-  if(useSub) drawScreen(s, line, true, &lv);
+  if(useSub) drawScreen(s, line, true, &lv, r);
 
   const uint16_t* zm = ppu->zbuf[0];
   const uint16_t* zs = ppu->zbuf[1];
   const uint16_t* cgram = ppu->cgram;
   const uint16_t* pal565 = ppu->pal565;
-  const uint8_t* lut5 = ppu->lut5;
-  const uint8_t* lut6 = ppu->lut6;
+  const uint32_t fixed = fixedColor(ppu);
   Spans cw;
   getSpans(ppu, 5, true, &cw);
   for(int i = 0; i < cw.n; i++) {
@@ -693,43 +739,405 @@ void ppu_runLine(Snes* s, int line) {
         continue;
       }
       lastKey = key;
-      int r = 0, g = 0, b = 0;
-      if(!clip) {
-        const uint16_t c = cgram[z & 0xff];
-        r = c & 0x1f;
-        g = (c >> 5) & 0x1f;
-        b = (c >> 10) & 0x1f;
-      }
-      int r2 = ppu->fixedColorR, g2 = ppu->fixedColorG, b2 = ppu->fixedColorB;
+      uint32_t c2 = fixed;
       bool half = ppu->halfColor;
       if(ppu->addSubscreen) {
         const uint16_t z2 = zs[x];
-        if(((z2 >> 8) & 0xf) != LAYER_BACKDROP) {
-          const uint16_t c2 = cgram[z2 & 0xff];
-          r2 = c2 & 0x1f;
-          g2 = (c2 >> 5) & 0x1f;
-          b2 = (c2 >> 10) & 0x1f;
-        } else {
-          half = false; /* the fixed colour standing in for the sub screen is never halved */
-        }
+        if(((z2 >> 8) & 0xf) != LAYER_BACKDROP) c2 = cgram[z2 & 0xff];
+        else half = false; /* the fixed colour standing in for the sub screen is never halved */
       }
-      if(ppu->subtractColor) {
-        r -= r2; g -= g2; b -= b2;
-      } else {
-        r += r2; g += g2; b += b2;
-      }
-      if(half) {
-        r >>= 1; g >>= 1; b >>= 1;
-      }
-      if(r > 31) r = 31;
-      if(g > 31) g = 31;
-      if(b > 31) b = 31;
-      if(r < 0) r = 0;
-      if(g < 0) g = 0;
-      if(b < 0) b = 0;
-      lastOut = (uint16_t)((lut5[r] << 11) | (lut6[g] << 5) | lut5[b]);
+      lastOut = blend565(ppu, clip ? 0 : cgram[z & 0xff], c2, half);
       out[x] = lastOut;
     }
   }
-  s->putLine(s->user, line - 1, out);
+}
+
+/* ------------------------------------------------- fast path, a band -- */
+
+/* What a band is made of when the fast path applies: the colour of the
+ * backdrop, then the layers to paint over it from back to front. */
+/* why a band went to the general renderer (statistics, see Ppu.statWhy) */
+enum { WHY_MODE = 1, WHY_COLOR_WINDOW, WHY_CLIP, WHY_TILES, WHY_WINDOW, WHY_MATH };
+
+enum {
+  BLEND_NONE = 0, /* plain colours */
+  BLEND_PAL = 1,  /* the blended palette (sprites: palettes 4-7 only) */
+  BLEND_ALL = 2,  /* the blended palette, sprites of all palettes */
+  BLEND_SUB = 3   /* sprites of palettes 4-7 are mixed with the sub screen pixel under them */
+};
+
+typedef struct Pass {
+  uint8_t layer; /* 0-3: background, 4: sprites */
+  uint8_t prio;  /* tile priority bit (backgrounds) or sprite priority */
+  uint8_t blend; /* BLEND_* */
+} Pass;
+
+typedef struct Plan {
+  uint16_t backdrop; /* RGB565 */
+  uint8_t n;
+  uint8_t mode;
+  uint8_t subShown; /* bit l: layer l (4: sprites) is part of the sub screen */
+  Pass pass[24];
+} Plan;
+
+/* Which layers of one screen (main or sub) are shown; false when the fast
+ * path cannot draw one of them. A window that hides a layer on the whole
+ * line, or nowhere, is fine: games leave them set up that way a lot. */
+static bool screenLayers(Ppu* ppu, int actMode, bool sub, uint32_t* shown) {
+  *shown = 0;
+  for(int layer = 0; layer < 5; layer++) {
+    const Layer* l = &ppu->layer[layer];
+    if(!(sub ? l->subScreenEnabled : l->mainScreenEnabled)) continue;
+    if(layer < 4 && bitDepthsPerMode[actMode][layer] == 5) continue;
+    Spans sp;
+    getSpans(ppu, layer, sub ? l->subScreenWindowed : l->mainScreenWindowed, &sp);
+    bool hidden;
+    if(!spansUniform(&sp, &hidden)) {
+      ppu->why = WHY_WINDOW;
+      return false;
+    }
+    if(hidden) continue; /* everywhere */
+    if(layer < 4) {
+      const BgLayer* bg = &ppu->bgLayer[layer];
+      if(bg->bigTiles || (bg->mosaicEnabled && ppu->mosaicSize > 1)) {
+        ppu->why = WHY_TILES;
+        return false;
+      }
+    }
+    *shown |= 1u << layer;
+  }
+  return true;
+}
+
+/* appends the shown layers of one screen, back to front */
+static void planScreen(Plan* plan, int actMode, uint32_t shown, bool sub, uint32_t mathMask, int objBlend) {
+  for(int i = layerCountPerMode[actMode] - 1; i >= 0; i--) {
+    const int layer = layersPerMode[actMode][i];
+    if(layer > 4 || !((shown >> layer) & 1)) continue;
+    Pass* p = &plan->pass[plan->n++];
+    p->layer = (uint8_t)layer;
+    p->prio = prioritysPerMode[actMode][i];
+    if(sub) p->blend = BLEND_ALL;
+    else if(!((mathMask >> layer) & 1)) p->blend = BLEND_NONE;
+    else p->blend = (uint8_t)(layer == 4 ? objBlend : BLEND_PAL);
+  }
+}
+
+/* Decides whether the current register state can be drawn by the fast path
+ * and, if so, how. Colour math is only taken when it boils down to using
+ * other colours:
+ *  - against the fixed colour: a layer that takes part is painted with a
+ *    palette blended once with that colour;
+ *  - against the sub screen when only the backdrop takes part (a common way
+ *    to show a background layer): where the main screen shows a layer the
+ *    sub screen does not matter, elsewhere the result is the sub screen
+ *    blended with the backdrop colour. So the sub screen layers are painted
+ *    first, with a palette blended with the backdrop, then the main ones;
+ *  - same when sprites take part too: their pixels are then mixed one by
+ *    one with the sub screen pixel under them (see subPixel). */
+static bool planBuild(Snes* s, Plan* plan) {
+  Ppu* ppu = &s->ppu;
+  ppu->why = WHY_MODE;
+  if(ppu->mode > 1) return false;
+  /* the colour window: fine as long as the whole line is on one side of it */
+  Spans cw;
+  getSpans(ppu, 5, true, &cw);
+  ppu->why = WHY_COLOR_WINDOW;
+  bool inWindow;
+  if(!spansUniform(&cw, &inWindow)) return false;
+  ppu->why = WHY_CLIP;
+  if(ppu->clipMode == 3 || (ppu->clipMode == 2 && inWindow) || (ppu->clipMode == 1 && !inWindow)) return false;
+  uint32_t mathMask = 0;
+  for(int i = 0; i < 6; i++) mathMask |= (uint32_t)ppu->mathEnabled[i] << i;
+  if(ppu->preventMathMode == 3 || (ppu->preventMathMode == 2 && inWindow) || (ppu->preventMathMode == 1 && !inWindow)) mathMask = 0;
+  const int actMode = ppu->mode == 1 && ppu->bg3priority ? 8 : ppu->mode;
+  plan->n = 0;
+  plan->mode = (uint8_t)actMode;
+  plan->subShown = 0;
+
+  uint32_t mainShown, subShown = 0;
+  if(!screenLayers(ppu, actMode, false, &mainShown)) return false;
+  /* layers that are not shown cannot take part in anything */
+  mathMask &= mainShown | 0x20;
+  if(mathMask && ppu->addSubscreen && !screenLayers(ppu, actMode, true, &subShown)) return false;
+
+  const uint32_t c0 = ppu->cgram[0];
+  const uint32_t fixed = fixedColor(ppu);
+  uint32_t key[3];
+  if(!mathMask) {
+    plan->backdrop = ppu->pal565[0];
+    planScreen(plan, actMode, mainShown, false, 0, BLEND_NONE);
+    return true;
+  }
+  if(!subShown) {
+    /* everything that takes part is mixed with the fixed colour (never
+     * halved when it stands in for an empty sub screen) */
+    const bool half = ppu->halfColor && !ppu->addSubscreen;
+    plan->backdrop = (mathMask & 0x20) ? blend565(ppu, c0, fixed, half) : ppu->pal565[0];
+    planScreen(plan, actMode, mainShown, false, mathMask, BLEND_PAL);
+    if(!(mathMask & 0x1f)) return true; /* only the backdrop: no palette needed */
+    key[0] = 0x10000u | fixed;
+    key[1] = ppu->cgramGen;
+    key[2] = (uint32_t)ppu->subtractColor | ((uint32_t)half << 1) | ((uint32_t)ppu->brightness << 8);
+    if(memcmp(ppu->palBlendKey, key, sizeof(key)) != 0) {
+      for(int i = 0; i < 0x100; i++) ppu->palBlend[i] = blend565(ppu, ppu->cgram[i], fixed, half);
+      memcpy(ppu->palBlendKey, key, sizeof(key));
+    }
+    return true;
+  }
+  /* against the sub screen: backdrop and sprites only */
+  ppu->why = WHY_MATH;
+  if(mathMask & 0x0f) return false;
+  plan->subShown = (uint8_t)subShown;
+  if(mathMask & 0x20) {
+    plan->backdrop = blend565(ppu, c0, fixed, false);
+    planScreen(plan, actMode, subShown, true, 0, BLEND_NONE);
+    key[0] = 0x20000u | c0;
+    key[1] = ppu->cgramGen;
+    key[2] = (uint32_t)ppu->subtractColor | ((uint32_t)ppu->halfColor << 1) | ((uint32_t)ppu->brightness << 8);
+    if(memcmp(ppu->palBlendKey, key, sizeof(key)) != 0) {
+      for(int i = 0; i < 0x100; i++) ppu->palBlend[i] = blend565(ppu, c0, ppu->cgram[i], ppu->halfColor);
+      memcpy(ppu->palBlendKey, key, sizeof(key));
+    }
+  } else {
+    plan->backdrop = ppu->pal565[0];
+  }
+  planScreen(plan, actMode, mainShown, false, mathMask, BLEND_SUB);
+  return true;
+}
+
+/* What the sub screen shows at one pixel: its cgram index, or -1 for
+ * nothing (the fixed colour then stands in). Slow, pixel-exact; only used
+ * for the few sprite pixels that are mixed with the sub screen. */
+static int subPixel(const Snes* s, const Plan* plan, int x, int line, int r) {
+  const Ppu* ppu = &s->ppu;
+  int bgIdx[4];
+  bool bgPrio[4] = {false, false, false, false};
+  uint32_t fetched = 0;
+  for(int i = 0; i < layerCountPerMode[plan->mode]; i++) {
+    const int layer = layersPerMode[plan->mode][i];
+    if(layer > 4 || !((plan->subShown >> layer) & 1)) continue;
+    const int prio = prioritysPerMode[plan->mode][i];
+    if(layer == 4) {
+      const uint32_t o = ppu->objRow[r][x];
+      if(o && (int)((o >> 8) & 3) == prio) return (int)(o & 0xff);
+      continue;
+    }
+    if(!((fetched >> layer) & 1)) {
+      const BgLayer* bg = &ppu->bgLayer[layer];
+      bgIdx[layer] = bgPixel(s, (x + bg->hScroll) & 0x3ff, (line + bg->vScroll) & 0x3ff, layer,
+                             bitDepthsPerMode[plan->mode][layer], &bgPrio[layer]);
+      fetched |= 1u << layer;
+    }
+    if(bgIdx[layer] && (int)bgPrio[layer] == prio) return bgIdx[layer];
+  }
+  return -1;
+}
+
+static inline uint32_t load32(const uint8_t* p) {
+  uint32_t v;
+  memcpy(&v, p, 4);
+  return v;
+}
+
+/* 8 pixels of a tile row, 4 bits each (0: transparent), leftmost in the low bits */
+static inline void paint8(uint16_t* d, uint32_t w, const uint16_t* pal) {
+  uint32_t p;
+  if((p = w & 15) != 0) d[0] = pal[p];
+  if((p = (w >> 4) & 15) != 0) d[1] = pal[p];
+  if((p = (w >> 8) & 15) != 0) d[2] = pal[p];
+  if((p = (w >> 12) & 15) != 0) d[3] = pal[p];
+  if((p = (w >> 16) & 15) != 0) d[4] = pal[p];
+  if((p = (w >> 20) & 15) != 0) d[5] = pal[p];
+  if((p = (w >> 24) & 15) != 0) d[6] = pal[p];
+  if((p = w >> 28) != 0) d[7] = pal[p];
+}
+
+/* same, for a tile that sticks out of the screen */
+static void paintClipped(uint16_t* row, int x, uint32_t w, const uint16_t* pal) {
+  for(int k = 0; k < 8; k++, w >>= 4) {
+    const uint32_t p = w & 15;
+    if(p && (unsigned)(x + k) < NS_SCREEN_W) row[x + k] = pal[p];
+  }
+}
+
+/* Paints the tiles of one background layer that have the given priority
+ * bit, over n lines starting at line y0. Each tile is looked up once for all
+ * the lines it covers. bpp: 2 or 4. */
+static inline __attribute__((always_inline)) void bandBgN(
+    Snes* s, const BgLayer* bg, const int bpp, const uint16_t* pal, uint32_t prioBit, int y0, int n) {
+  Ppu* ppu = &s->ppu;
+  const uint32_t hScroll = bg->hScroll;
+  const int xFine = (int)(hScroll & 7);
+  const int cols = xFine ? 33 : 32;
+  const int palShift = bpp == 2 ? 2 : 4;
+  int line = 0;
+  while(line < n) {
+    const uint32_t ly = (uint32_t)(y0 + line + bg->vScroll) & 0x3ff;
+    const int rowIn = (int)(ly & 7);
+    int seg = 8 - rowIn;
+    if(seg > n - line) seg = n - line;
+    uint32_t rowAdr = bg->tilemapAdr + (((ly >> 3) & 0x1f) << 5);
+    if((ly & 0x100) && bg->tilemapHigher) rowAdr += bg->tilemapWider ? 0x800 : 0x400;
+    /* the 32 entries of a tilemap row are 64 bytes that never straddle two pages */
+    const uint8_t* mapL = tileData(s, rowAdr);
+    const uint8_t* mapR = bg->tilemapWider ? tileData(s, rowAdr + 0x400) : mapL;
+    uint16_t* band = ppu->band + line * NS_SCREEN_W;
+    uint32_t tcol = hScroll >> 3;
+    int x = -xFine;
+    for(int c = 0; c < cols; c++, tcol++, x += 8) {
+      const uint8_t* e = ((tcol & 0x20) ? mapR : mapL) + ((tcol & 0x1f) << 1);
+      const uint32_t tile = (uint32_t)(e[0] | (e[1] << 8));
+      if((tile & 0x2000) != prioBit) continue;
+      const uint8_t* data = tileData(s, bg->tileAdr + (tile & 0x3ff) * (uint32_t)(bpp * 4));
+      /* a tile with nothing in it (most of a status bar layer, the sky...) */
+      uint32_t any = load32(data) | load32(data + 4) | load32(data + 8) | load32(data + 12);
+      if(bpp == 4) any |= load32(data + 16) | load32(data + 20) | load32(data + 24) | load32(data + 28);
+      if(!any) continue;
+      const uint32_t* lut = ppu->spread[(tile >> 14) & 1];
+      const uint16_t* tp = pal + (((tile >> 10) & 7) << palShift);
+      int trow = rowIn;
+      int step = 1;
+      if(tile & 0x8000) {
+        trow = 7 - rowIn;
+        step = -1;
+      }
+      const bool inside = x >= 0 && x <= NS_SCREEN_W - 8;
+      uint16_t* row = band;
+      for(int j = 0; j < seg; j++, trow += step, row += NS_SCREEN_W) {
+        const uint8_t* p = data + trow * 2;
+        uint32_t w = lut[p[0]] | (lut[p[1]] << 1);
+        if(bpp == 4) w |= (lut[p[16]] << 2) | (lut[p[17]] << 3);
+        if(!w) continue;
+        if(inside) paint8(row + x, w, tp);
+        else paintClipped(row, x, w, tp);
+      }
+    }
+    line += seg;
+  }
+}
+
+static __attribute__((noinline)) void bandBg2(Snes* s, const BgLayer* bg, const uint16_t* pal, uint32_t prioBit, int y0, int n) {
+  bandBgN(s, bg, 2, pal, prioBit, y0, n);
+}
+
+static __attribute__((noinline)) void bandBg4(Snes* s, const BgLayer* bg, const uint16_t* pal, uint32_t prioBit, int y0, int n) {
+  bandBgN(s, bg, 4, pal, prioBit, y0, n);
+}
+
+/* sprite pixels of one priority */
+static void bandObj(Snes* s, const Plan* plan, uint32_t prio, int blend, int y0, int n) {
+  Ppu* ppu = &s->ppu;
+  const uint32_t want = (OBJ_PIXEL >> 8) | prio;
+  const uint16_t* plain = ppu->pal565;
+  const uint16_t* mixed = (blend == BLEND_PAL || blend == BLEND_ALL) ? ppu->palBlend : plain;
+  for(int r = 0; r < n; r++) {
+    if(!(ppu->objPrioMask[r] & (1u << prio))) continue;
+    const uint16_t* buf = ppu->objRow[r];
+    uint16_t* d = ppu->band + r * NS_SCREEN_W;
+    for(int t = 0; t < ppu->objSlivers[r]; t++) {
+      int x = ppu->objSliverX[r][t];
+      int end = x + 8;
+      if(x < 0) x = 0;
+      if(end > NS_SCREEN_W) end = NS_SCREEN_W;
+      for(; x < end; x++) {
+        const uint32_t o = buf[x];
+        if((o >> 8) != want) continue;
+        const uint32_t idx = o & 0xff;
+        /* palettes 0-3 never take part in colour math on the main screen */
+        if(idx < 0xc0 && blend != BLEND_ALL) {
+          d[x] = plain[idx];
+        } else if(blend != BLEND_SUB) {
+          d[x] = mixed[idx];
+        } else {
+          const int sub = subPixel(s, plan, x, y0 + r, r);
+          d[x] = sub < 0 ? blend565(ppu, ppu->cgram[idx], fixedColor(ppu), false)
+                         : blend565(ppu, ppu->cgram[idx], ppu->cgram[sub], ppu->halfColor);
+        }
+      }
+    }
+  }
+}
+
+static void bandFast(Snes* s, const Plan* plan, int y0, int n) {
+  Ppu* ppu = &s->ppu;
+  /* backdrop */
+  {
+    const uint16_t c = plan->backdrop;
+    uint16_t* d = ppu->band;
+    for(int i = 0; i < n * NS_SCREEN_W; i++) d[i] = c;
+  }
+  for(int i = 0; i < plan->n; i++) {
+    const Pass* p = &plan->pass[i];
+    if(p->layer == 4) {
+      bandObj(s, plan, p->prio, p->blend, y0, n);
+      continue;
+    }
+    const uint16_t* pal = (p->blend ? ppu->palBlend : ppu->pal565) + (ppu->mode == 0 ? 32 * p->layer : 0);
+    const BgLayer* bg = &ppu->bgLayer[p->layer];
+    if(bitDepthsPerMode[plan->mode][p->layer] == 2) bandBg2(s, bg, pal, p->prio ? 0x2000 : 0, y0, n);
+    else bandBg4(s, bg, pal, p->prio ? 0x2000 : 0, y0, n);
+  }
+}
+
+/* --------------------------------------------------------------- entry -- */
+
+void ppu_init(Snes* s) {
+  Ppu* ppu = &s->ppu;
+  for(uint32_t b = 0; b < 0x100; b++) {
+    uint32_t normal = 0, flipped = 0;
+    for(int i = 0; i < 8; i++) {
+      if(b & (0x80u >> i)) normal |= 1u << (4 * i);
+      if(b & (1u << i)) flipped |= 1u << (4 * i);
+    }
+    ppu->spread[0][b] = normal;
+    ppu->spread[1][b] = flipped;
+  }
+}
+
+/* draws lines first..last (1-based), all with the current register state */
+static void renderLines(Snes* s, int first, int last) {
+  Ppu* ppu = &s->ppu;
+  Plan plan;
+  plan.n = 0;
+  plan.mode = 0;
+  plan.subShown = 0;
+  bool fast = false;
+  if(!ppu->forcedBlank) {
+    ppu_buildLuts(ppu);
+    fast = planBuild(s, &plan);
+  }
+  for(int y0 = first; y0 <= last;) {
+    int n = last - y0 + 1;
+    if(n > NS_BAND) n = NS_BAND;
+    if(ppu->forcedBlank) {
+      memset(ppu->band, 0, (size_t)n * NS_SCREEN_W * sizeof(uint16_t));
+    } else {
+      for(int r = 0; r < n; r++) evalSprites(s, y0 + r - 1, r);
+      if(fast) {
+        bandFast(s, &plan, y0, n);
+        ppu->statFastLines += (uint32_t)n;
+      } else {
+        for(int r = 0; r < n; r++) slowLine(s, y0 + r, r, ppu->band + r * NS_SCREEN_W);
+        ppu->statSlowLines += (uint32_t)n;
+        ppu->statWhy[ppu->why & 7] += (uint32_t)n;
+      }
+    }
+    s->putRows(s->user, y0 - 1, n, ppu->band);
+    y0 += n;
+  }
+}
+
+/* A line is "due" once the beam is halfway through it (LakeSnes draws it at
+ * that point). Called before anything the picture depends on changes, and
+ * when vertical blanking starts. */
+void ppu_flush(Snes* s) {
+  Ppu* ppu = &s->ppu;
+  if(s->inVblank || !s->renderFrame || s->refPpu || s->vPos == 0) return;
+  int due = snes_hPos(s) >= 512 ? s->vPos : s->vPos - 1;
+  if(due > NS_SCREEN_H_OVERSCAN) due = NS_SCREEN_H_OVERSCAN;
+  if(due <= ppu->renderedLine) return;
+  const int first = ppu->renderedLine + 1;
+  ppu->renderedLine = (uint8_t)due;
+  renderLines(s, first, due);
 }

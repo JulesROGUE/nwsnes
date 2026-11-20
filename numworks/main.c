@@ -3,7 +3,8 @@
  *
  * The game comes as the app's external data: a "pack" made on a PC by
  * snes2nw (ROM + page dictionary). All the RAM the calculator leaves to
- * external apps, minus this app's own few kilobytes, becomes the page pool.
+ * external apps, minus this app's own data (about 30 KB, mostly the buffers
+ * of the renderer), becomes the page pool.
  *
  * Home and On/Off are handled by the calculator itself and leave the app.
  */
@@ -25,9 +26,12 @@ extern uint8_t* ns_sim_heap_start;
 extern uint8_t* ns_sim_heap_end;
 #define HEAP_START ns_sim_heap_start
 #define HEAP_END ns_sim_heap_end
+#define RAM_START (ns_sim_heap_start - sizeof(Snes))
 #else
 extern uint8_t _heap_start;
 extern uint8_t _heap_end;
+extern uint8_t _data_section_start_ram; /* first byte of the RAM given to the app */
+#define RAM_START (&_data_section_start_ram)
 #define HEAP_START (&_heap_start)
 #define HEAP_END (&_heap_end)
 #endif
@@ -38,10 +42,13 @@ extern uint8_t _heap_end;
 
 static Snes snes;
 
-static void putLine(void* user, int y, const uint16_t* line) {
+/* a band of the picture, straight to the display: one call for up to NS_BAND lines */
+static void putRows(void* user, int y, int count, const uint16_t* rows) {
   (void)user;
   if(y < 0 || y >= NS_SCREEN_H) return;
-  eadk_display_push_rect((eadk_rect_t){SCREEN_X, (uint16_t)(SCREEN_Y + y), NS_SCREEN_W, 1}, line);
+  if(y + count > NS_SCREEN_H) count = NS_SCREEN_H - y; /* overscan lines do not fit on the screen */
+  eadk_display_push_rect((eadk_rect_t){SCREEN_X, (uint16_t)(SCREEN_Y + y), NS_SCREEN_W, (uint16_t)count},
+                         (const eadk_color_t*)rows);
 }
 
 /* ------------------------------------------------------------- text -- */
@@ -144,16 +151,16 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  snes_init(&snes, pool, poolBytes, putLine, NULL);
+  snes_init(&snes, pool, poolBytes, putRows, NULL);
   pack_attach(&pack, &snes);
   snes_reset(&snes, true);
 
   /* start screen. It stays up until a key is pressed so the RAM figure can
    * be read: it is the number snes2nw needs (--ram-kb) to give a verdict. */
-  text(0, "nwsnes 0.1");
+  text(0, "nwsnes 0.2");
   text(1, pack.title);
   char* p = putStr(buf, "RAM totale: ");
-  p = putNum(p, (poolBytes + 8192) / 1024);
+  p = putNum(p, (uint32_t)((uintptr_t)HEAP_END - (uintptr_t)RAM_START) / 1024);
   putStr(p, " Ko");
   text(3, buf);
   p = putStr(buf, "RAM pour le jeu: ");

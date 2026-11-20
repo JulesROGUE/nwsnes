@@ -89,7 +89,7 @@ void ppu_refRunLine(Snes* s, int line) {
   for(int x = 0; x < 256; x++) {
     ppu_handlePixel(ppu, x, line);
   }
-  s->putLine(s->user, line - 1, ppu->line);
+  s->putRows(s->user, line - 1, 1, ppu->band);
 }
 
 static void ppu_handlePixel(Ppu* ppu, int x, int y) {
@@ -146,7 +146,7 @@ static void ppu_handlePixel(Ppu* ppu, int x, int y) {
     }
   }
   // nwsnes: 256 pixels wide, RGB565, main screen pixel only
-  ppu->line[x] = (uint16_t)((ppu->lut5[r] << 11) | (ppu->lut6[g] << 5) | ppu->lut5[b]);
+  ppu->band[x] = (uint16_t)((ppu->lut5[r] << 11) | (ppu->lut6[g] << 5) | ppu->lut5[b]);
   (void) r2; (void) g2; (void) b2;
 }
 

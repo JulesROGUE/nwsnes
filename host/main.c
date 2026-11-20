@@ -30,9 +30,9 @@ typedef struct Session {
   uint16_t fb[NS_SCREEN_W * FB_H];
 } Session;
 
-static void putLine(void* user, int y, const uint16_t* line) {
+static void putRows(void* user, int y, int count, const uint16_t* rows) {
   Session* se = user;
-  if(y >= 0 && y < FB_H) memcpy(se->fb + y * NS_SCREEN_W, line, NS_SCREEN_W * sizeof(uint16_t));
+  if(y >= 0 && y + count <= FB_H) memcpy(se->fb + y * NS_SCREEN_W, rows, (size_t)count * NS_SCREEN_W * sizeof(uint16_t));
 }
 
 static uint8_t* loadFile(const char* path, uint32_t* size) {
@@ -118,10 +118,11 @@ static Session* sessionNew(const NsPack* pack, uint32_t poolPages, bool refPpu) 
   Session* se = calloc(1, sizeof(Session));
   se->poolBytes = poolPages * NS_PAGE_SIZE;
   se->pool = malloc(se->poolBytes ? se->poolBytes : 1);
-  snes_init(&se->snes, se->pool, se->poolBytes, putLine, se);
+  snes_init(&se->snes, se->pool, se->poolBytes, putRows, se);
   pack_attach(pack, &se->snes);
   se->snes.refPpu = refPpu;
-  /* the reference session never uses speed-ups */
+  se->snes.refCpu = refPpu; /* the reference session: LakeSnes' interpreter and renderer */
+  /* ...and it never uses speed-ups */
   if(refPpu || g_exact) se->snes.speedHacks = false;
   snes_reset(&se->snes, true);
   return se;
@@ -387,6 +388,8 @@ int main(int argc, char** argv) {
            b->snes.pager.poolPages, b->snes.pager.poolPages / 4.0, b->snes.pager.peakUsed,
            b->snes.pager.peakUsed / 4.0, b->snes.pager.statCow, b->snes.pager.statCollects,
            b->snes.pager.statDedupZero, b->snes.pager.statDedupDict);
+    printf("device: %u lines drawn by the fast path, %u by the general renderer\n",
+           b->snes.ppu.statFastLines, b->snes.ppu.statSlowLines);
     (void)firstBad;
     if(badFrames || (memBad && g_exact)) rc = 1;
     sessionFree(a);
@@ -417,6 +420,8 @@ int main(int argc, char** argv) {
     printf("pool %u pages (%.1f KB), peak used %u pages (%.1f KB), %u copy-on-write, %u collections\n",
            se->snes.pager.poolPages, se->snes.pager.poolPages / 4.0, se->snes.pager.peakUsed,
            se->snes.pager.peakUsed / 4.0, se->snes.pager.statCow, se->snes.pager.statCollects);
+    printf("%u lines drawn by the fast path, %u by the general renderer\n",
+           se->snes.ppu.statFastLines, se->snes.ppu.statSlowLines);
     sessionFree(se);
   }
   free(in.script);

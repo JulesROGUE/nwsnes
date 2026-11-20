@@ -37,9 +37,9 @@ static uint16_t g_fb[NS_SCREEN_W * NS_SCREEN_H_OVERSCAN];
 static const uint16_t* g_movie; /* recorded inputs, one per frame, or NULL */
 static uint32_t g_movieLen;
 
-static void putLine(void* user, int y, const uint16_t* line) {
+static void putRows(void* user, int y, int count, const uint16_t* rows) {
   (void)user;
-  if(y >= 0 && y < NS_SCREEN_H_OVERSCAN) memcpy(g_fb + y * NS_SCREEN_W, line, NS_SCREEN_W * sizeof(uint16_t));
+  if(y >= 0 && y + count <= NS_SCREEN_H_OVERSCAN) memcpy(g_fb + y * NS_SCREEN_W, rows, (size_t)count * NS_SCREEN_W * sizeof(uint16_t));
 }
 
 static uint16_t inputAt(uint32_t seed, uint32_t frame) {
@@ -110,7 +110,7 @@ int EXPORT(nsw_session)(const uint8_t* pack, uint32_t packSize, uint32_t poolPag
   g_pool = malloc(poolPages * NS_PAGE_SIZE);
   if(!g_pool) return 2;
   memset(g_fb, 0, sizeof(g_fb));
-  snes_init(&g_snes, g_pool, poolPages * NS_PAGE_SIZE, putLine, NULL);
+  snes_init(&g_snes, g_pool, poolPages * NS_PAGE_SIZE, putRows, NULL);
   pack_attach(&g_pack, &g_snes);
   if(exact) g_snes.speedHacks = false;
   snes_reset(&g_snes, true);

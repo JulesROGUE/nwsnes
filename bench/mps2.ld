@@ -7,6 +7,8 @@ ENTRY(Reset_Handler)
 SECTIONS {
   .text : {
     KEEP(*(.vectors))
+    . = ALIGN(32);
+    INCLUDE core/hot.ld
     *(.text .text.*)
     *(.rodata .rodata.*)
     . = ALIGN(4);

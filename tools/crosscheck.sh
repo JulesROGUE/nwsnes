@@ -8,7 +8,7 @@ REF=$1; DIR=$2; FRAMES=${3:-300}; SEED=${4:-7}; shift 4 2>/dev/null
 HOST=$(dirname "$0")/../build/nwsnes-host
 same=0; total=0
 for f in $(find "$DIR" -name "*.sfc" | sort); do
-  "$REF" "$f" "$FRAMES" "$SEED" x 1 2>/dev/null | grep "^f" > /tmp/crosscheck_a.txt
+  "$REF" "$f" "$FRAMES" "$SEED" /dev/null 1 2>/dev/null | grep "^f" > /tmp/crosscheck_a.txt
   "$HOST" "$f" --frames "$FRAMES" --seed "$SEED" --hash-each "$@" 2>/dev/null | grep "^f" > /tmp/crosscheck_b.txt
   total=$((total+1))
   d=$(diff /tmp/crosscheck_a.txt /tmp/crosscheck_b.txt | grep -c '^<')

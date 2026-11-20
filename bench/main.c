@@ -26,6 +26,9 @@ extern const uint32_t bench_pack_size;
 #ifndef BENCH_SEED
 #define BENCH_SEED 7
 #endif
+#ifndef BENCH_SKIP
+#define BENCH_SKIP 0 /* frames run before the measurement starts (menus, loading) */
+#endif
 #ifndef BENCH_POOL_KB
 #define BENCH_POOL_KB 90
 #endif
@@ -78,30 +81,61 @@ static void outNum(uint64_t v) {
   out(buf + n);
 }
 
-static Snes snes;
-static uint8_t pool[BENCH_POOL_KB * 1024];
-static uint16_t sink[NS_SCREEN_W];
-static uint32_t checksum;
-
-static void putLine(void* user, int y, const uint16_t* line) {
-  (void)user;
-  memcpy(sink, line, sizeof(sink)); /* stands for handing the line to the display */
-  checksum = checksum * 31 + line[(y * 7) & 255];
+/* inputs: an optional recorded script linked into the image (pairs of
+ * little-endian u16: one button state per frame), else the button masher */
+extern const uint8_t bench_inputs[];
+extern const uint32_t bench_inputs_size;
+static uint16_t benchInput(uint32_t f) {
+  if(bench_inputs_size >= 2) {
+    uint32_t n = bench_inputs_size / 2;
+    if(f >= n) f = n - 1;
+    return (uint16_t)(bench_inputs[f * 2] | (bench_inputs[f * 2 + 1] << 8));
+  }
+  return ns_autoInput(BENCH_SEED, f);
 }
 
-static uint64_t run(const NsPack* pack, bool render, uint32_t* oomAt) {
-  snes_init(&snes, pool, sizeof(pool), putLine, 0);
+static Snes snes;
+static uint8_t pool[BENCH_POOL_KB * 1024];
+static uint16_t sink[NS_BAND * NS_SCREEN_W];
+static uint32_t checksum;
+
+static void putRows(void* user, int y, int count, const uint16_t* rows) {
+  (void)user;
+  memcpy(sink, rows, (size_t)count * NS_SCREEN_W * sizeof(uint16_t)); /* stands for handing the band to the display */
+  for(int i = 0; i < count; i++) checksum = checksum * 31 + rows[i * NS_SCREEN_W + (((y + i) * 7) & 255)];
+}
+
+/* a store here tells the cache-model plugin (when one is loaded) that a
+ * measurement window starts or ends */
+volatile uint32_t bench_marker;
+
+#ifndef BENCH_PHASES
+#define BENCH_PHASES 7 /* which measurements to run: 1 draw every frame, 2 draw nothing, 4 draw some */
+#endif
+#ifndef BENCH_DRAW_EVERY
+#define BENCH_DRAW_EVERY 4 /* third measurement: draw one frame out of this many, like a slow calculator */
+#endif
+
+/* drawEvery: 1 = every frame, 0 = never, n = one frame out of n */
+static uint64_t run(const NsPack* pack, uint32_t drawEvery, uint32_t* oomAt) {
+  snes_init(&snes, pool, sizeof(pool), putRows, 0);
   pack_attach(pack, &snes);
   snes_reset(&snes, true);
   *oomAt = 0xffffffffu;
-  uint64_t t0 = ticks();
-  for(uint32_t f = 0; f < BENCH_FRAMES; f++) {
-    snes_setPad(&snes, 0, ns_autoInput(BENCH_SEED, f));
-    snes.renderFrame = render;
+  uint64_t t0 = 0;
+  for(uint32_t f = 0; f < BENCH_SKIP + BENCH_FRAMES; f++) {
+    if(f == BENCH_SKIP) {
+      bench_marker = 1;
+      t0 = ticks();
+    }
+    snes_setPad(&snes, 0, benchInput(f));
+    snes.renderFrame = f >= BENCH_SKIP && drawEvery && f % drawEvery == 0;
     snes_runFrame(&snes);
     if(snes.pager.oom && *oomAt == 0xffffffffu) *oomAt = f;
   }
-  return ticks() - t0;
+  uint64_t t = ticks() - t0;
+  bench_marker = 2;
+  return t;
 }
 
 int main(void) {
@@ -120,14 +154,22 @@ int main(void) {
   }
   out("bench: \""); out(pack.title); out("\", "); outNum(BENCH_FRAMES); out(" frames, pool ");
   outNum(BENCH_POOL_KB); out(" KB\n");
-  uint64_t all = run(&pack, true, &oom);
-  out("drawing every frame: "); outNum(all / BENCH_FRAMES); out(" instructions/frame");
-  if(oom != 0xffffffffu) { out(" (OUT OF RAM at frame "); outNum(oom); out(")"); }
-  pager_collect(&snes.pager); /* the high-water mark is taken when collecting */
-  out(", peak RAM pages "); outNum(snes.pager.peakUsed); out(", collections "); outNum(snes.pager.statCollects);
-  out(", checksum "); outNum(checksum); out("\n");
-  uint64_t none = run(&pack, false, &oom);
-  out("drawing nothing:     "); outNum(none / BENCH_FRAMES); out(" instructions/frame\n");
+  if(BENCH_PHASES & 1) {
+    uint64_t all = run(&pack, 1, &oom);
+    out("drawing every frame: "); outNum(all / BENCH_FRAMES); out(" instructions/frame");
+    if(oom != 0xffffffffu) { out(" (OUT OF RAM at frame "); outNum(oom); out(")"); }
+    pager_collect(&snes.pager); /* the high-water mark is taken when collecting */
+    out(", peak RAM pages "); outNum(snes.pager.peakUsed); out(", collections "); outNum(snes.pager.statCollects);
+    out(", checksum "); outNum(checksum); out("\n");
+  }
+  if(BENCH_PHASES & 2) {
+    uint64_t none = run(&pack, 0, &oom);
+    out("drawing nothing:     "); outNum(none / BENCH_FRAMES); out(" instructions/frame\n");
+  }
+  if(BENCH_PHASES & 4) {
+    uint64_t some = run(&pack, BENCH_DRAW_EVERY, &oom);
+    out("drawing 1 frame in "); outNum(BENCH_DRAW_EVERY); out(": "); outNum(some / BENCH_FRAMES); out(" instructions/frame\n");
+  }
   quit();
   return 0;
 }

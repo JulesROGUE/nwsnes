@@ -24,8 +24,7 @@ static const uint8_t transferLength[8] = {
 
 /* cycles spent inside a scanline event: must not re-enter the event handler */
 static inline void rawCycles(Snes* s, int cycles) {
-  s->hPos = (uint16_t)(s->hPos + cycles);
-  s->cycles += (uint32_t)cycles;
+  s->left -= cycles;
 }
 
 void dma_reset(Snes* s) {
@@ -127,6 +126,38 @@ static void transferByte(Snes* s, uint16_t aAdr, uint8_t aBank, uint8_t bAdr, bo
   }
 }
 
+/* Where the bytes of an A-bus address can be read directly: work ram or
+ * ROM. Returns how many bytes follow at increasing addresses without leaving
+ * that page (work ram) or that half bank (ROM); 0 when the address is
+ * something else (registers, battery ram, open bus). */
+typedef struct DmaSource {
+  const uint8_t* rom; /* ROM: the byte itself */
+  uint32_t vpage;     /* work ram: virtual page (the pointer is looked up for every byte, pages can move) */
+  uint32_t off;
+} DmaSource;
+
+static uint32_t dmaSource(const Snes* s, uint32_t bank, uint32_t adr, DmaSource* src) {
+  src->rom = NULL;
+  src->vpage = 0;
+  src->off = 0;
+  if(bank == 0x7e || bank == 0x7f) {
+    src->vpage = NS_VP_WRAM + (((bank & 1) << 8) | (adr >> 8));
+    src->off = adr & 0xff;
+    return 0x100 - src->off;
+  }
+  if(!(bank & 0x40) && adr < 0x2000) {
+    src->vpage = NS_VP_WRAM + (adr >> 8);
+    src->off = adr & 0xff;
+    return 0x100 - src->off;
+  }
+  const uint8_t* half = s->romHalf[(bank << 1) | (adr >> 15)];
+  if(half) {
+    src->rom = half + (adr & 0x7fff);
+    return 0x8000 - (adr & 0x7fff);
+  }
+  return 0;
+}
+
 static void doDma(Snes* s, int cpuCycles) {
   Dma* dma = &s->dma;
   /* align to multiple of 8 */
@@ -139,6 +170,30 @@ static void doDma(Snes* s, int cpuCycles) {
     snes_addCycles(s, 8); /* overhead per channel */
     int offIndex = 0;
     while(ch->dmaActive) {
+      /* nwsnes: the usual transfer, memory to a B-bus port going up, without
+       * decoding both addresses again for every byte. Same accesses in the
+       * same order; any byte during which a scanline event is due goes
+       * through the general code below. */
+      DmaSource src;
+      uint32_t run = (ch->fromB || ch->fixed || ch->decrement) ? 0 : dmaSource(s, ch->aBank, ch->aAdr, &src);
+      const bool ram = run && !src.rom;
+      while(run && s->left > 8) {
+        s->left -= 8;
+        const uint8_t val = src.rom ? *src.rom++ : s->pager.ptr[src.vpage][src.off++];
+        s->openBus = val;
+        const uint8_t bAdr = (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode][offIndex++]);
+        offIndex &= 3;
+        /* 0x2180 via the b-bus while the a-bus reads ram: nothing is written */
+        if(bAdr < 0x40) ppu_write(s, bAdr, val);
+        else if(!(ram && bAdr == 0x80)) snes_writeBBus(s, bAdr, val);
+        ch->aAdr++;
+        run--;
+        if(--ch->size == 0) {
+          ch->dmaActive = false;
+          run = 0;
+        }
+      }
+      if(!ch->dmaActive) break;
       snes_addCycles(s, 8); /* hdma may run in here and stop this channel */
       transferByte(s, ch->aAdr, ch->aBank, (uint8_t)(ch->bAdr + bAdrOffsets[ch->mode][offIndex++]), ch->fromB);
       offIndex &= 3;
@@ -245,6 +300,7 @@ void dma_handleDma(Snes* s, int cpuCycles) {
     return;
   }
   if(dma->dmaState == 2) {
+    snes_dmaBias(s, false);
     doDma(s, cpuCycles);
     dma->dmaState = 0;
   }
@@ -261,7 +317,9 @@ void dma_startDma(Snes* s, uint8_t val, bool hdma) {
   }
   if(hdma) {
     dma->hdmaAny = val != 0;
+    snes_reschedule(s); /* the HDMA event of this line may have to run, or not any more */
   } else {
     dma->dmaState = val != 0 ? 1 : 0;
+    snes_dmaBias(s, dma->dmaState != 0); /* the next bus access of the cpu must see it */
   }
 }

@@ -38,22 +38,32 @@ typedef struct Cpu {
   bool xf;
   bool mf;
   bool e;
-  /* power state (WAI/STP) */
-  bool waiting;
-  bool stopped;
-  /* interrupts */
+  /* interrupt lines */
   bool irqWanted;
   bool nmiWanted;
-  bool intWanted;
   bool resetWanted;
+  bool intPend; /* nmiWanted || (irqWanted && !i), kept up to date by whoever changes one of them */
+  /* Everything that keeps the next opcode from simply being fetched. The
+   * four flags are read as one word by the fast core. */
+  union {
+    struct {
+      bool waiting;   /* WAI */
+      bool stopped;   /* STP */
+      bool intWanted; /* an interrupt is taken instead of the next opcode */
+      bool frameDone; /* the frame is over: leave cpu_run() */
+    };
+    uint32_t special;
+  };
   /* wait-loop detection: state at the last backward jump */
   uint32_t loopTarget;
   uint32_t loopSig[3];
-  uint32_t loopWrites;
 } Cpu;
 
 void cpu_reset(Snes* s, bool hard);
-void cpu_runOpcode(Snes* s);
+void cpu_run(Snes* s); /* runs until the frame is over */
+#ifdef NS_WITH_REFERENCE
+void cpu_refRunOpcode(Snes* s); /* LakeSnes' interpreter, one opcode at a time */
+#endif
 
 /* ---------------------------------------------------------------- DMA -- */
 
@@ -123,6 +133,10 @@ typedef struct WindowLayer {
 #define NS_SCREEN_W 256
 #define NS_SCREEN_H 224
 #define NS_SCREEN_H_OVERSCAN 239
+/* The picture is drawn late and in bands of this many lines (see ppu.c) */
+#define NS_BAND 16
+/* at most 34 sprite tiles (8 pixels wide) are fetched for a line */
+#define NS_SLIVERS 34
 
 typedef struct Ppu {
   /* vram access (the VRAM itself lives in the pager) */
@@ -208,29 +222,51 @@ typedef struct Ppu {
   bool countersLatched;
   uint8_t ppu1openBus;
   uint8_t ppu2openBus;
-  /* line renderer working buffers. One entry per pixel:
-   * bits 15-12 priority level, 11-8 layer code, 7-0 cgram index */
-  uint16_t zbuf[2][NS_SCREEN_W]; /* main screen, sub screen */
-  uint16_t objBuf[NS_SCREEN_W];
-  bool objBufDirty;
-  uint16_t objMinX, objMaxX; /* columns of objBuf in use: [objMinX, objMaxX) */
+  /* ---- renderer (ppu.c) ---- */
+  uint8_t renderedLine;  /* last line of this frame already drawn (0: none) */
+  uint8_t regLast[0x40]; /* last value written to each register... */
+  uint64_t regKnown;     /* ...when its bit is set here */
+  uint32_t statFastLines; /* statistics: lines drawn by the fast path... */
+  uint32_t statSlowLines; /* ...and by the general renderer */
+  uint32_t statWhy[8];    /* ...because of: see the WHY_ codes in ppu.c */
+  uint8_t why;
   uint8_t lutBrightness; /* brightness the tables below were built for (0xff: none) */
   uint8_t lut5[32];      /* 5-bit channel -> 5-bit output (red, blue) */
   uint8_t lut6[32];      /* 5-bit channel -> 6-bit output (green) */
-  uint16_t line[NS_SCREEN_W]; /* RGB565 output of the current line */
-  uint16_t pal565[0x100];     /* cgram at the current brightness, as RGB565 */
-  /* sprites that can show up somewhere on screen, in oam order: saves
-   * scanning all 128 on every line */
+  uint16_t pal565[0x100]; /* cgram at the current brightness, as RGB565 */
+  uint32_t cgramGen;      /* counts the writes to cgram */
+  /* cgram blended once and for all with the colour it is always mixed with
+   * (see the fast path), and what it was built for */
+  uint16_t palBlend[0x100];
+  uint32_t palBlendKey[3];
+  /* sprites that can show up somewhere on screen, in the order they are
+   * scanned: saves looking at all 128 on every line */
   uint8_t objList[128];
   uint8_t objCount;
+  uint8_t objListStart; /* first sprite of the scan the list was built for */
   bool objListDirty;
+  /* bit plane byte -> 8 pixels, 4 bits each, leftmost pixel in the low
+   * bits ([0]) or in the high bits ([1], flipped tiles). In RAM on purpose. */
+  uint32_t spread[2][0x100];
+  /* line working buffers of the general renderer. One entry per pixel:
+   * bits 15-12 priority level, 11-8 layer code, 7-0 cgram index */
+  uint16_t zbuf[2][NS_SCREEN_W]; /* main screen, sub screen */
+  /* sprite pixels of each line of the band: 0x8000 | priority << 8 | cgram
+   * index, or 0. Only the tiles listed in objSliverX can be non-zero. */
+  uint16_t objRow[NS_BAND][NS_SCREEN_W];
+  int16_t objSliverX[NS_BAND][NS_SLIVERS]; /* left edge of each tile drawn (-7..255) */
+  uint8_t objSlivers[NS_BAND];
+  uint8_t objPrioMask[NS_BAND]; /* bit p: some sprite pixel of priority p on that line */
+  /* RGB565 output of the band being drawn */
+  uint16_t band[NS_BAND * NS_SCREEN_W];
 } Ppu;
 
 void ppu_reset(Snes* s);
 bool ppu_checkOverscan(Snes* s);
 void ppu_handleVblank(Snes* s);
 void ppu_handleFrameStart(Snes* s);
-void ppu_runLine(Snes* s, int line); /* line 1..224/239 */
+void ppu_init(Snes* s);  /* once, builds the constant tables */
+void ppu_flush(Snes* s); /* draws the lines that are due and not drawn yet */
 void ppu_buildLuts(Ppu* ppu);
 #ifdef NS_WITH_REFERENCE
 void ppu_refRunLine(Snes* s, int line); /* LakeSnes' per-pixel renderer */
@@ -285,49 +321,62 @@ enum {
   NS_BTN_R = 1 << 11
 };
 
-typedef void (*NsPutLine)(void* user, int y, const uint16_t* rgb565);
+/* Receives the picture: count rows of 256 RGB565 pixels, the first one being
+ * row y of the screen (0 = top). Rows come in increasing order, in bands of
+ * at most NS_BAND. */
+typedef void (*NsPutRows)(void* user, int y, int count, const uint16_t* rgb565);
+
+/* While a DMA is pending, this much is taken off Snes.left so that every
+ * bus access of the fast cpu core goes through the slow, complete path. */
+#define NS_DMA_BIAS 0x10000000
 
 struct Snes {
-  Cpu cpu;
-  Dma dma;
-  Ppu ppu;
-  Cart cart;
-  ApuStub apu;
-  Pager pager;
-  bool palTiming;
-  /* video output */
-  NsPutLine putLine;
-  void* user;
-  bool renderFrame; /* false: skip drawing this frame (frame skip) */
-  bool refPpu;      /* host builds only: use the slow reference renderer */
-  /* input */
-  uint16_t pad[2];         /* current buttons */
-  uint16_t padLatched[2];
-  bool padLatchLine;
-  /* wram access through $2180 */
-  uint32_t ramAdr;
-  /* timing */
-  uint16_t hPos; /* master cycles since the start of the line */
+  Cpu cpu; /* must stay first: the cpu core casts Cpu* to Snes* */
+  /* ---- hot: read on every bus access of the cpu core ---- */
+  int32_t left;           /* master cycles until snes_handleEvents must run (<= 0: now) */
+  const uint8_t* codePtr; /* codePtr[pc] is the opcode byte, for pc >= codeMin */
+  uint32_t codeMin;       /* 0, 0x8000, or 0x10000 when the program bank is not plain ROM */
+  uint8_t codeCycles;     /* access time of the program bank */
+  uint8_t openBus;
+  bool loopDirty;         /* the cpu wrote to the bus since the last wait-loop check */
+  bool loopIo;            /* ...or read something else than memory */
+  uint8_t romCycles[2];   /* access time of ROM in banks 00-7f / 80-ff */
+  bool speedHacks;        /* skip loops that only wait; clear for exact timing */
+  bool refCpu;            /* host builds only: use the reference interpreter */
+  int32_t leftBias;       /* NS_DMA_BIAS while a DMA is pending, else 0 */
+  /* ---- timing ---- */
+  uint16_t nextEvent; /* position in the line (hPos) at which snes_handleEvents must run */
   uint16_t vPos;
-  uint16_t nextEvent; /* hPos at which snes_handleEvents must run */
   uint16_t lineLen;
   uint16_t irqH; /* hPos of the irq on this line, or 0xffff */
   bool irqLevel; /* v-only irq: condition currently true */
   uint8_t evIdx;
   bool frameReady;
+  bool palTiming;
+  uint32_t cycleBase; /* master cycles at the start of the line, wraps */
   uint32_t frames;
-  uint32_t cycles; /* master cycles, wraps */
   uint32_t syncCycle;
-  uint32_t autoJoyEnd; /* value of cycles at which auto-joypad read is over */
+  uint32_t autoJoyEnd; /* value of snes_cycles() at which auto-joypad read is over */
+  /* video output */
+  NsPutRows putRows;
+  void* user;
+  bool renderFrame; /* false: skip drawing this frame (frame skip) */
+  bool refPpu;      /* host builds only: use the slow reference renderer */
+  /* input */
+  bool padLatchLine;
+  uint16_t pad[2]; /* current buttons */
+  uint16_t padLatched[2];
+  /* wram access through $2180 */
+  uint32_t ramAdr;
   /* nmi / irq */
   bool hIrqEnabled;
   bool vIrqEnabled;
   bool nmiEnabled;
-  uint16_t hTimer;
-  uint16_t vTimer;
   bool inNmi;
   bool inIrq;
   bool inVblank;
+  uint16_t hTimer;
+  uint16_t vTimer;
   /* joypad handling */
   uint16_t portAutoRead[4];
   bool autoJoyRead;
@@ -340,14 +389,14 @@ struct Snes {
   uint16_t divideResult;
   /* misc */
   bool fastMem;
-  uint8_t openBus;
-  /* speed-ups (see snes.c). speedHacks may be cleared to get the exact,
-   * slower behaviour, which the tests compare against. */
-  bool speedHacks;
-  uint16_t codeBank;      /* bank codePtr is valid for, 0xffff: none */
-  uint8_t codeCycles;     /* access time of that bank */
-  const uint8_t* codePtr; /* codePtr[adr] for adr 0x8000-0xffff of codeBank */
-  uint32_t writeCount;    /* bus writes by the cpu, to spot loops that only wait */
+  Cart cart;
+  ApuStub apu;
+  Pager pager;
+  /* Where each 32 KB half of each bank sits in the ROM image, or NULL when
+   * that half is not plain ROM (system area, work ram, battery ram). */
+  const uint8_t* romHalf[512];
+  Dma dma;
+  Ppu ppu;
 };
 
 /* ROM description, as found in the pack or guessed from a raw ROM image */
@@ -359,7 +408,7 @@ typedef struct NsRomInfo {
 } NsRomInfo;
 
 /* The caller provides the RAM pool. Nothing is allocated by the core. */
-void snes_init(Snes* s, uint8_t* pool, uint32_t poolBytes, NsPutLine putLine, void* user);
+void snes_init(Snes* s, uint8_t* pool, uint32_t poolBytes, NsPutRows putRows, void* user);
 void snes_setRom(Snes* s, const uint8_t* rom, const NsRomInfo* info);
 void snes_reset(Snes* s, bool hard);
 void snes_runFrame(Snes* s);
@@ -368,6 +417,7 @@ static inline void snes_setPad(Snes* s, int player, uint16_t buttons) { s->pad[p
 /* used by cpu, dma, ppu */
 void snes_handleEvents(Snes* s);
 void snes_updateIrq(Snes* s);
+void snes_reschedule(Snes* s);
 uint8_t snes_readBBus(Snes* s, uint8_t adr);
 void snes_writeBBus(Snes* s, uint8_t adr, uint8_t val);
 uint8_t snes_read(Snes* s, uint32_t adr);
@@ -376,13 +426,35 @@ void snes_cpuIdle(Snes* s, bool waiting);
 uint8_t snes_cpuRead(Snes* s, uint32_t adr);
 void snes_cpuWrite(Snes* s, uint32_t adr, uint8_t val);
 void snes_syncCycles(Snes* s, bool start, int syncCycles);
-void snes_setCodeBank(Snes* s, uint32_t bank);
+void snes_setCodeBank(Snes* s); /* after cpu.k or the memory map changed */
 void snes_skipToEvent(Snes* s);
+void snes_skipToInterrupt(Snes* s);
+
+/* master cycles since the start of the line */
+static inline uint32_t snes_hPos(const Snes* s) {
+  return (uint32_t)((int32_t)s->nextEvent - s->left - s->leftBias);
+}
+
+/* master cycles since power on, wraps */
+static inline uint32_t snes_cycles(const Snes* s) {
+  return s->cycleBase + snes_hPos(s);
+}
 
 static inline void snes_addCycles(Snes* s, int cycles) {
-  s->hPos = (uint16_t)(s->hPos + cycles);
-  s->cycles += (uint32_t)cycles;
-  if(s->hPos >= s->nextEvent) snes_handleEvents(s);
+  s->left -= cycles;
+  if(s->left <= 0) snes_handleEvents(s);
+}
+
+/* a DMA is waiting (or no longer): see NS_DMA_BIAS */
+static inline void snes_dmaBias(Snes* s, bool on) {
+  const int32_t bias = on ? NS_DMA_BIAS : 0;
+  s->left -= bias - s->leftBias;
+  s->leftBias = bias;
+}
+
+/* to call after changing cpu.nmiWanted, cpu.irqWanted or cpu.i */
+static inline void snes_intPend(Snes* s) {
+  s->cpu.intPend = s->cpu.nmiWanted || (s->cpu.irqWanted && !s->cpu.i);
 }
 
 /* video ram, 0x8000 words, through the pager */

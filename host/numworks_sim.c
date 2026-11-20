@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../core/snes.h"
+
 int app_main(int argc, char* argv[]);
 
 const char* eadk_external_data;
@@ -56,9 +58,9 @@ void eadk_display_push_rect(eadk_rect_t r, const eadk_color_t* pixels) {
       if(sx < EADK_SCREEN_WIDTH && sy < EADK_SCREEN_HEIGHT) screen[sy * EADK_SCREEN_WIDTH + sx] = pixels[y * r.width + x];
     }
   }
-  if(r.width == 256 && r.height == 1) {
-    linesPushed++;
-    if(r.y == 8) framesDrawn++; /* first line of the game picture */
+  if(r.width == 256 && r.height <= NS_BAND) { /* a band of the game picture */
+    linesPushed += r.height;
+    if(r.y == 8) framesDrawn++; /* its first line */
   }
 }
 

@@ -54,7 +54,10 @@ reset = func('ppu_reset')
 reset = reset.replace('void ppu_reset(Ppu* ppu) {', 'void ppu_reset(Snes* s) {\n  Ppu* ppu = &s->ppu;\n  /* video RAM is cleared by pager_reset() on a hard reset */')
 reset = reset.replace('  memset(ppu->vram, 0, sizeof(ppu->vram));\n', '')
 reset = reset.replace('  memset(ppu->objPixelBuffer, 0, sizeof(ppu->objPixelBuffer));\n  memset(ppu->objPriorityBuffer, 0, sizeof(ppu->objPriorityBuffer));\n',
-                      '  memset(ppu->objBuf, 0, sizeof(ppu->objBuf));\n  ppu->objBufDirty = false;\n  ppu->objMinX = NS_SCREEN_W;\n  ppu->objMaxX = 0;\n  ppu->lutBrightness = 0xff;\n')
+                      '  memset(ppu->objRow, 0, sizeof(ppu->objRow));\n  memset(ppu->objSlivers, 0, sizeof(ppu->objSlivers));\n'
+                      '  memset(ppu->objPrioMask, 0, sizeof(ppu->objPrioMask));\n  ppu->renderedLine = 0;\n  ppu->palBlendKey[0] = 0xffffffffu;\n'
+                      '  ppu->regKnown = 0;\n'
+                      '  ppu->lutBrightness = 0xff;\n')
 reset = reset.replace('  memset(ppu->pixelBuffer, 0, sizeof(ppu->pixelBuffer));\n', '')
 assert 'vram' not in reset.replace('vramPointer','').replace('vramIncrement','').replace('vramRemap','').replace('vramRead','').replace('video RAM','')
 regs += reset + '\n'
@@ -70,6 +73,11 @@ rd = func('ppu_read')
 rd = rd.replace('uint8_t ppu_read(Ppu* ppu, uint8_t adr) {', 'uint8_t ppu_read(Snes* s, uint8_t adr) {\n  Ppu* ppu = &s->ppu;')
 rd = rd.replace('ppu->vram[ppu_getVramRemap(ppu) & 0x7fff]', 'snes_vramRead(s, ppu_getVramRemap(ppu))')
 rd = rd.replace('ppu->snes->', 's->')
+rd = rd.replace('ppu->hCount = s->hPos / 4;', 'ppu->hCount = (uint16_t)(snes_hPos(s) / 4);')
+assert 'snes_hPos' in rd
+# nwsnes: the picture is drawn late; reading the sprite flags or stepping
+# through OAM needs it to be up to date first
+rd = rd.replace('  Ppu* ppu = &s->ppu;\n', '  Ppu* ppu = &s->ppu;\n  if(adr == 0x38 || adr == 0x3e) ppu_flush(s);\n', 1)
 assert 'ppu->vram[' not in rd
 regs += rd + '\n'
 
@@ -85,6 +93,34 @@ wr = wr.replace('''      uint16_t vramAdr = ppu_getVramRemap(ppu);
 '''      uint32_t vramAdr = ppu_getVramRemap(ppu) & 0x7fff;
       pager_write(&s->pager, NS_VP_VRAM + (vramAdr >> 7), ((vramAdr & 0x7f) << 1) | 1, val);''')
 wr = wr.replace('ppu->snes->', 's->')
+# nwsnes: the picture is drawn late: before a register changes, draw the lines
+# that were due with the old value. Nothing is ever due during vertical blanking.
+wr = wr.replace('  Ppu* ppu = &s->ppu;\n', '''  Ppu* ppu = &s->ppu;
+  adr &= 0x3f;
+  if(!s->inVblank) {
+    /* nwsnes: the picture is drawn late. Before a register changes, the lines
+     * that are due are drawn with the old value... unless the write cannot
+     * change the picture: games that drive a register from HDMA often send
+     * the same value on every line */
+    const uint8_t kind = kRegKind[adr];
+    if(!(kind == 2 || (kind == 1 && ((ppu->regKnown >> adr) & 1) && ppu->regLast[adr] == val))) ppu_flush(s);
+  }
+  ppu->regLast[adr] = val;
+  ppu->regKnown |= 1ull << adr;
+''', 1)
+wr = '''/* nwsnes: what a write to each register means for the picture.
+ * 0: anything (always draw the lines that are due first);
+ * 1: the register just holds the value: writing the same one again changes nothing;
+ * 2: the picture does not depend on it (video ram and palette addresses,
+ *    video port control, read-only registers). */
+static const uint8_t kRegKind[0x40] = {
+  1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, /* 00-0f */
+  0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 1, 0, 0, 0, 0, 0, /* 10-1f */
+  0, 2, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, /* 20-2f */
+  1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2  /* 30-3f */
+};
+
+''' + wr
 assert 'ppu->vram[' not in wr
 regs += wr
 regs = re.sub(r'      // fallthrough to normal layer BG-[HV]OFS\n    \}\n', '    }\n    /* fallthrough */\n', regs)
@@ -93,7 +129,8 @@ old = '''        ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer
 new = '''        const uint16_t c = (uint16_t)((val << 8) | ppu->cgramBuffer);
         ppu->pal565[ppu->cgramPointer] = (uint16_t)(
           (ppu->lut5[c & 0x1f] << 11) | (ppu->lut6[(c >> 5) & 0x1f] << 5) | ppu->lut5[(c >> 10) & 0x1f]);
-        ppu->cgram[ppu->cgramPointer++] = c;'''
+        ppu->cgram[ppu->cgramPointer++] = c;
+        ppu->cgramGen++;'''
 assert old in regs
 regs = regs.replace(old, new)
 for case in ('    case 0x01: {\n', '    case 0x04: {\n', '    case 0x33: {\n'):
@@ -143,7 +180,7 @@ void ppu_refRunLine(Snes* s, int line) {
   for(int x = 0; x < 256; x++) {
     ppu_handlePixel(ppu, x, line);
   }
-  s->putLine(s->user, line - 1, ppu->line);
+  s->putRows(s->user, line - 1, 1, ppu->band);
 }
 
 '''
@@ -152,7 +189,7 @@ hp = func('ppu_handlePixel')
 # keep the colour maths, replace the 512-wide BGRX output by one RGB565 pixel
 cutpos = hp.index('  int row = (y - 1) + (ppu->evenFrame ? 0 : 239);')
 hp = hp[:cutpos] + '''  // nwsnes: 256 pixels wide, RGB565, main screen pixel only
-  ppu->line[x] = (uint16_t)((ppu->lut5[r] << 11) | (ppu->lut6[g] << 5) | ppu->lut5[b]);
+  ppu->band[x] = (uint16_t)((ppu->lut5[r] << 11) | (ppu->lut6[g] << 5) | ppu->lut5[b]);
   (void) r2; (void) g2; (void) b2;
 }
 '''
