@@ -116,7 +116,6 @@ for ch in CHARS:
         for x in range(5):
             if g[y][x] == '#':
                 pix[y][x + 1] = 2
-                if pix[y + 1][x + 2] == 0: pix[y + 1][x + 2] = 1   # drop shadow
     tiles2.append(pix)
 while len(tiles2) < 64:
     tiles2.append([[0] * 8 for _ in range(8)])

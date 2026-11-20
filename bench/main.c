@@ -15,6 +15,7 @@
 
 #include "../core/pack.h"
 #include "../core/snes.h"
+#include "../pc/autoinput.h"
 
 extern const uint8_t bench_pack[];
 extern const uint32_t bench_pack_size;
@@ -77,35 +78,6 @@ static void outNum(uint64_t v) {
   out(buf + n);
 }
 
-/* ---- same button masher as the host harness ---- */
-static uint32_t mix(uint32_t x) {
-  x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
-  return x;
-}
-static uint16_t autoInput(uint32_t seed, uint32_t frame) {
-  if(seed == 0) return 0;
-  uint32_t block = frame / 20;
-  uint32_t r = mix(seed * 0x9e3779b9u + block);
-  uint16_t pad = 0;
-  if((r & 7) == 0) return (frame % 20) < 4 ? NS_BTN_START : 0;
-  if((r & 7) == 1) return 0;
-  switch((r >> 3) & 7) {
-    case 0: pad |= NS_BTN_LEFT; break;
-    case 1: case 2: case 3: pad |= NS_BTN_RIGHT; break;
-    case 4: pad |= NS_BTN_UP; break;
-    case 5: pad |= NS_BTN_DOWN; break;
-    default: break;
-  }
-  if(r & 0x100) pad |= NS_BTN_B;
-  if(r & 0x200) pad |= NS_BTN_Y;
-  if((r & 0xc00) == 0xc00) pad |= NS_BTN_A;
-  if((r & 0x3000) == 0x3000) pad |= NS_BTN_X;
-  if((r & 0x1c000) == 0x1c000) pad |= NS_BTN_L;
-  if((r & 0xe0000) == 0xe0000) pad |= NS_BTN_R;
-  if((frame % 20) >= 16) pad &= (uint16_t)~NS_BTN_B;
-  return pad;
-}
-
 static Snes snes;
 static uint8_t pool[BENCH_POOL_KB * 1024];
 static uint16_t sink[NS_SCREEN_W];
@@ -124,7 +96,7 @@ static uint64_t run(const NsPack* pack, bool render, uint32_t* oomAt) {
   *oomAt = 0xffffffffu;
   uint64_t t0 = ticks();
   for(uint32_t f = 0; f < BENCH_FRAMES; f++) {
-    snes_setPad(&snes, 0, autoInput(BENCH_SEED, f));
+    snes_setPad(&snes, 0, ns_autoInput(BENCH_SEED, f));
     snes.renderFrame = render;
     snes_runFrame(&snes);
     if(snes.pager.oom && *oomAt == 0xffffffffu) *oomAt = f;

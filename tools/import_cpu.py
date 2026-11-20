@@ -62,10 +62,10 @@ new = '''static uint8_t cpu_readOpcode(Cpu* cpu) {
 static void cpu_loopCheck(Cpu* cpu) {
   Snes* s = (Snes*)cpu;
   if(!s->speedHacks) return;
-  uint32_t target = (cpu->k << 16) | cpu->pc;
-  uint32_t sig0 = cpu->a | (cpu->x << 16);
-  uint32_t sig1 = cpu->y | (cpu->sp << 16);
-  uint32_t sig2 = cpu->dp | (cpu->db << 16) | (cpu_getFlags(cpu) << 24);
+  uint32_t target = ((uint32_t)cpu->k << 16) | cpu->pc;
+  uint32_t sig0 = cpu->a | ((uint32_t)cpu->x << 16);
+  uint32_t sig1 = cpu->y | ((uint32_t)cpu->sp << 16);
+  uint32_t sig2 = cpu->dp | ((uint32_t)cpu->db << 16) | ((uint32_t)cpu_getFlags(cpu) << 24);
   if(target == cpu->loopTarget && s->writeCount == cpu->loopWrites &&
      sig0 == cpu->loopSig[0] && sig1 == cpu->loopSig[1] && sig2 == cpu->loopSig[2]) {
     snes_skipToEvent(s);

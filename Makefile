@@ -2,9 +2,10 @@
 #
 #   make host      PC test harness (build/nwsnes-host), with the reference renderer
 #   make nwa       the calculator app (build/nwsnes.nwa), needs arm-none-eabi-gcc + node
+#   make sim       the calculator front end running on the PC (build/numworks-sim)
 #   make bench PACK=x  instructions per frame on an emulated Cortex-M7 (needs qemu-system-arm)
 #   make wasm      the core + profiler as WebAssembly, for the snes2nw PC tool (needs zig)
-#   make test      builds the test ROM and runs the checks
+#   make test      runs the checks on the test ROM (make testrom rebuilds that ROM, needs cc65)
 #   make clean
 
 BUILD := build
@@ -16,7 +17,7 @@ HOST_CC ?= cc
 HOST_CFLAGS ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter
 HOST_CFLAGS += -DNS_WITH_REFERENCE
 
-.PHONY: all host nwa nwa-check bench wasm test clean
+.PHONY: all host nwa nwa-check sim bench wasm testrom test clean
 all: host
 
 host: $(BUILD)/nwsnes-host
@@ -61,6 +62,22 @@ nwa-check: $(BUILD)/nwsnes.nwa
 	$(NWLINK) nwa-elf --external-data $(BUILD)/empty.pack $< $(BUILD)/nwsnes.elf
 	arm-none-eabi-size -A $(BUILD)/nwsnes.elf | grep -E "section|\.text|\.rodata|\.data|\.bss"
 
+# ---- the calculator front end, run on the PC against stand-in EADK calls ----
+EADK_INC = $(shell $(NWLINK) eadk-cflags-device | sed 's/.*"-I\([^"]*\)".*/\1/')
+sim: $(BUILD)/numworks-sim
+$(BUILD)/numworks-sim: $(CORE) numworks/main.c host/numworks_sim.c $(HEADERS) | $(BUILD)
+	$(HOST_CC) $(HOST_CFLAGS) -DNS_SIM -DPLATFORM_DEVICE=1 -Dmain=app_main -I"$(EADK_INC)" -c numworks/main.c -o $(BUILD)/sim_main.o
+	$(HOST_CC) $(HOST_CFLAGS) -DPLATFORM_DEVICE=1 -I"$(EADK_INC)" $(CORE) core/ppu_ref.c host/numworks_sim.c $(BUILD)/sim_main.o -o $@
+
+# ---- WebAssembly module for the PC tool -----------------------------------
+# "pip install ziglang" provides zig as "python3 -m ziglang"
+ZIG ?= python3 -m ziglang
+wasm: $(BUILD)/nwsnes.wasm
+
+$(BUILD)/nwsnes.wasm: $(CORE) $(PC) wasm/api.c $(HEADERS) | $(BUILD)
+	$(ZIG) cc -target wasm32-wasi -mexec-model=reactor -O2 -s -std=c11 -Wall \
+	  $(CORE) $(PC) wasm/api.c -o $@
+
 # ---- instruction count on an emulated Cortex-M7 (see bench/main.c) --------
 # make bench PACK=game.pack [FRAMES=600] [SEED=7] [POOL_KB=90]
 FRAMES ?= 600
@@ -83,6 +100,20 @@ bench: $(CORE) bench/main.c bench/startup.c bench/mps2.ld $(HEADERS) | $(BUILD)
 	  -nostartfiles --specs=nano.specs --specs=nosys.specs -Wl,--gc-sections -T bench/mps2.ld -o $(BUILD)/bench.elf
 	qemu-system-arm -M mps2-an500 -cpu cortex-m7 -nographic -monitor none -serial none \
 	  -icount shift=0 -semihosting-config enable=on,target=native -kernel $(BUILD)/bench.elf
+
+# ---- test ROM (original program and graphics, see tests/rom) and tests -----
+# A prebuilt copy is kept in tests/rom/nwsnes-test.sfc; "make testrom"
+# rebuilds it from source (needs python3 and cc65).
+TESTROM := tests/rom/nwsnes-test.sfc
+testrom:
+	mkdir -p $(BUILD)/testrom
+	python3 tests/rom/gen_assets.py $(BUILD)/testrom
+	ca65 --cpu 65816 --bin-include-dir $(BUILD)/testrom tests/rom/test.s -o $(BUILD)/testrom/test.o
+	ld65 -C tests/rom/lorom.cfg $(BUILD)/testrom/test.o -o $(TESTROM)
+	python3 tests/rom/fix_checksum.py $(TESTROM)
+
+test: host
+	sh tests/run.sh
 
 $(BUILD):
 	mkdir -p $@

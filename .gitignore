@@ -3,3 +3,4 @@ node_modules/
 *.sfc
 *.smc
 *.pack
+!tests/rom/nwsnes-test.sfc

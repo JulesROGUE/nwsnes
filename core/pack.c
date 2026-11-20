@@ -40,7 +40,11 @@ bool pack_open(const uint8_t* data, size_t size, NsPack* out) {
   out->dictCount = dictCount;
   out->apuMode = data[42];
   out->frameSkip = data[43];
-  memcpy(out->title, data + 48, 16);
+  /* the title ends up on screen: keep it to plain printable characters */
+  for(int i = 0; i < 16; i++) {
+    uint8_t ch = data[48 + i];
+    out->title[i] = ch == 0 ? 0 : ((ch >= 0x20 && ch < 0x7f) ? (char)ch : '?');
+  }
   out->title[16] = 0;
   return true;
 }

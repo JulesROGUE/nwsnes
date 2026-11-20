@@ -17,6 +17,7 @@
 
 #include "../core/pack.h"
 #include "../core/snes.h"
+#include "../pc/autoinput.h"
 #include "../pc/profiler.h"
 #include "../pc/romhdr.h"
 
@@ -80,42 +81,6 @@ static uint32_t fnv(const void* data, size_t n, uint32_t h) {
 
 /* ---------------------------------------------------------------- input -- */
 
-static uint32_t mix(uint32_t x) {
-  x ^= x >> 16;
-  x *= 0x7feb352du;
-  x ^= x >> 15;
-  x *= 0x846ca68bu;
-  x ^= x >> 16;
-  return x;
-}
-
-/* Deterministic "button masher": holds a random set of buttons for a third
- * of a second, taps Start now and then to get through title screens. */
-static uint16_t autoInput(uint32_t seed, uint32_t frame) {
-  if(seed == 0) return 0;
-  uint32_t block = frame / 20;
-  uint32_t r = mix(seed * 0x9e3779b9u + block);
-  uint16_t pad = 0;
-  if((r & 7) == 0) return (frame % 20) < 4 ? NS_BTN_START : 0;
-  if((r & 7) == 1) return 0;
-  switch((r >> 3) & 7) {
-    case 0: pad |= NS_BTN_LEFT; break;
-    case 1: case 2: case 3: pad |= NS_BTN_RIGHT; break;
-    case 4: pad |= NS_BTN_UP; break;
-    case 5: pad |= NS_BTN_DOWN; break;
-    default: break;
-  }
-  if(r & 0x100) pad |= NS_BTN_B;
-  if(r & 0x200) pad |= NS_BTN_Y;
-  if((r & 0xc00) == 0xc00) pad |= NS_BTN_A;
-  if((r & 0x3000) == 0x3000) pad |= NS_BTN_X;
-  if((r & 0x1c000) == 0x1c000) pad |= NS_BTN_L;
-  if((r & 0xe0000) == 0xe0000) pad |= NS_BTN_R;
-  /* release B a little before the end of the block so jumps can repeat */
-  if((frame % 20) >= 16) pad &= (uint16_t)~NS_BTN_B;
-  return pad;
-}
-
 typedef struct Inputs {
   uint32_t seed;
   uint16_t* script; /* one entry per frame, or NULL */
@@ -124,7 +89,7 @@ typedef struct Inputs {
 
 static uint16_t inputAt(const Inputs* in, uint32_t frame) {
   if(in->script) return frame < in->scriptLen ? in->script[frame] : 0;
-  return autoInput(in->seed, frame);
+  return ns_autoInput(in->seed, frame);
 }
 
 /* script file: lines of "<first frame> <hex buttons>", held until the next line */
@@ -214,6 +179,7 @@ static void usage(void) {
     "  --pool-kb N         RAM pool of the device configuration (default: unlimited)\n"
     "  --ref               draw with the reference renderer\n"
     "  --compare           run reference and device side by side, compare every frame\n"
+    "                      (pixels always; memory too, meaningful with --exact)\n"
     "  --dump DIR          write frames as PPM into DIR\n"
     "  --dump-every N      ...one frame out of N (default 60)\n"
     "  --hash              print a hash of the last frame and of the whole run\n"
@@ -412,13 +378,17 @@ int main(int argc, char** argv) {
     pager_collect(&b->snes.pager);
     printf("compare: %u frames, %u with different pixels%s, %u with different memory\n", frames, badFrames,
            badFrames ? " (first shown above)" : "", memBad);
+    if(memBad && !g_exact) {
+      printf("compare: note: with the speed-ups on, interrupts land on a different instruction of the game's\n"
+             "         wait loop, which leaves different stale bytes on its stack. Use --exact to compare memory.\n");
+    }
     printf("device: pool %u pages (%.1f KB), peak used %u pages (%.1f KB), %u copy-on-write, %u collections,"
            " given back: %u zero + %u dictionary\n",
            b->snes.pager.poolPages, b->snes.pager.poolPages / 4.0, b->snes.pager.peakUsed,
            b->snes.pager.peakUsed / 4.0, b->snes.pager.statCow, b->snes.pager.statCollects,
            b->snes.pager.statDedupZero, b->snes.pager.statDedupDict);
     (void)firstBad;
-    if(badFrames || memBad) rc = 1;
+    if(badFrames || (memBad && g_exact)) rc = 1;
     sessionFree(a);
     sessionFree(b);
   } else {

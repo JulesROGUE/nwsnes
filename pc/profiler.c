@@ -113,6 +113,18 @@ static int32_t intern(NsProfiler* p, uint32_t hash, const uint8_t* content) {
   return (int32_t)idx;
 }
 
+void prof_seed(NsProfiler* p, const uint8_t* packData, uint32_t packSize) {
+  NsPack pack;
+  if(!pack_open(packData, packSize, &pack)) return;
+  for(uint32_t i = 0; i < pack.dictCount; i++) {
+    const uint8_t* e = pack.dict + i * NS_DICT_ENTRY_SIZE;
+    const uint8_t* content = pack.base + ns_rd32(e + 4);
+    int32_t idx = intern(p, ns_rd32(e), content);
+    /* earlier sessions vouched for it: make sure it outranks one-off pages */
+    if(idx >= 0 && p->entries[idx].weight < 1000) p->entries[idx].weight = 1000;
+  }
+}
+
 void prof_sample(NsProfiler* p, const Snes* s) {
   p->frames++;
   for(unsigned vp = 0; vp < NS_VP_COUNT; vp++) {

@@ -41,6 +41,9 @@ typedef struct NsPackStats {
 
 NsProfiler* prof_new(void);
 void prof_free(NsProfiler* p);
+/* Starts from the dictionary of an existing pack, so that a new play session
+ * adds to what earlier ones found instead of replacing it. */
+void prof_seed(NsProfiler* p, const uint8_t* packData, uint32_t packSize);
 /* call once per emulated frame */
 void prof_sample(NsProfiler* p, const Snes* s);
 /* returns a malloc'ed pack (NULL on failure); stats may be NULL */

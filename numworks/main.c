@@ -19,8 +19,18 @@ const char eadk_app_name[] __attribute__((section(".rodata.eadk_app_name"))) = "
 const uint32_t eadk_api_level __attribute__((section(".rodata.eadk_api_level"))) = 0;
 
 /* limits of the RAM left after this app's own data, set by the nwlink linker script */
+#ifdef NS_SIM
+/* PC simulation of this file (host/numworks_sim.c): the "heap" is a plain buffer */
+extern uint8_t* ns_sim_heap_start;
+extern uint8_t* ns_sim_heap_end;
+#define HEAP_START ns_sim_heap_start
+#define HEAP_END ns_sim_heap_end
+#else
 extern uint8_t _heap_start;
 extern uint8_t _heap_end;
+#define HEAP_START (&_heap_start)
+#define HEAP_END (&_heap_end)
+#endif
 
 #define SCREEN_X ((EADK_SCREEN_WIDTH - NS_SCREEN_W) / 2)
 #define SCREEN_Y ((EADK_SCREEN_HEIGHT - NS_SCREEN_H) / 2)
@@ -88,23 +98,27 @@ static uint16_t readPad(eadk_keyboard_state_t k) {
 
 /* ------------------------------------------------------------- stats -- */
 
-/* left margin, four characters wide: frames drawn per second, emulation
- * speed in percent, RAM pages in use and free (toggle with the 0 key) */
+/* Left margin (32 pixels = four small characters), toggled with the 0 key:
+ * frames drawn per second, emulation speed in percent, RAM used by the game
+ * and RAM still free, both in KB. */
+static void statLine(int row, uint32_t value, char unit) {
+  char buf[12];
+  char* end = putNum(buf, value);
+  if(unit) *end++ = unit;
+  *end = 0;
+  /* exactly four characters, or the text would spill over the picture */
+  char out[5] = {' ', ' ', ' ', ' ', 0};
+  int n = (int)(end - buf);
+  if(n > 4) n = 4;
+  memcpy(out + 4 - n, buf, (size_t)n);
+  eadk_display_draw_string(out, (eadk_point_t){2, (uint16_t)(40 + row * 16)}, false, 0xffe0, eadk_color_black);
+}
+
 static void drawStats(uint32_t fps, uint32_t speed) {
-  char buf[8];
-  const eadk_color_t fg = 0xffe0, bg = eadk_color_black;
-  char* p = putNum(buf, fps);
-  putStr(p, "  ");
-  eadk_display_draw_string(buf, (eadk_point_t){2, 40}, false, fg, bg);
-  p = putNum(buf, speed);
-  putStr(p, "% ");
-  eadk_display_draw_string(buf, (eadk_point_t){2, 56}, false, fg, bg);
-  p = putNum(buf, pager_usedPages(&snes.pager));
-  putStr(p, "  ");
-  eadk_display_draw_string(buf, (eadk_point_t){2, 72}, false, fg, bg);
-  p = putNum(buf, snes.pager.freeCount);
-  putStr(p, "  ");
-  eadk_display_draw_string(buf, (eadk_point_t){2, 88}, false, fg, bg);
+  statLine(0, fps, 0);
+  statLine(1, speed, '%');
+  statLine(2, pager_usedPages(&snes.pager) / 4, 'K');
+  statLine(3, snes.pager.freeCount / 4u, 'K');
 }
 
 int main(int argc, char* argv[]) {
@@ -113,8 +127,8 @@ int main(int argc, char* argv[]) {
   char buf[48];
   eadk_display_push_rect_uniform(eadk_screen_rect, eadk_color_black);
 
-  uint8_t* pool = (uint8_t*)(((uintptr_t)&_heap_start + 3) & ~(uintptr_t)3);
-  uint32_t poolBytes = (uint32_t)((uintptr_t)&_heap_end - (uintptr_t)pool);
+  uint8_t* pool = (uint8_t*)(((uintptr_t)HEAP_START + 3) & ~(uintptr_t)3);
+  uint32_t poolBytes = (uint32_t)((uintptr_t)HEAP_END - (uintptr_t)pool);
 
   NsPack pack;
   if(!pack_open((const uint8_t*)eadk_external_data, eadk_external_data_size, &pack)) {
