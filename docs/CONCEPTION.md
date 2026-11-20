@@ -101,9 +101,9 @@ C'est le point le plus fragile face aux jeux du commerce.
 
 Couvert, sur PC : identité du cœur rapide et de la référence (processeur, rendu, mémoire octet pour octet) sur 91 ROM de test et sur des sessions de trois jeux du commerce ; comparaison avec LakeSnes non modifié ; robustesse aux packs abîmés ; logique de cadence de l'appli avec une horloge simulée ; édition de liens de l'appli par `nwlink` ; installation en deux parties contre une calculatrice simulée, y compris quand elle refuse ou ignore l'écriture (tests de snes2nw).
 
-Couvert, sur une calculatrice (N0110, système 25.2.0) : l'appli démarre et fait tourner des jeux du commerce ; tailles de la RAM et des zones d'applis ; vitesse de la flash et de la RAM ; lecture et écriture de l'autre moitié de la flash ; un jeu en deux parties, mesuré une fois à 99 % de sa vitesse.
+Couvert, sur une calculatrice (N0110, système 25.2.0) : l'appli démarre et fait tourner des jeux du commerce ; tailles de la RAM et des zones d'applis ; vitesse de la flash et de la RAM ; lecture et écriture de l'autre moitié de la flash ; Donkey Kong Country en deux parties, mesuré une fois en plein niveau à 99 % de sa vitesse (39 images affichées par seconde).
 
-Non couvert : les autres modèles et les autres versions du système ; une mesure de vitesse dans les conditions du banc d'essai, pour confronter le modèle (nombre d'instructions et d'accès manqués au cache).
+Non couvert : les autres modèles et les autres versions du système ; une mesure de vitesse dans les conditions du banc d'essai, pour recaler le modèle (nombre d'instructions et d'accès manqués au cache), que la mesure ci-dessus montre environ deux fois trop pessimiste.
 
 ## Pistes
 

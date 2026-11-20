@@ -2,7 +2,7 @@
 
 Un cœur d'émulateur SNES taillé pour la calculatrice **NumWorks** (appli externe `.nwa`), dont la mémoire vive ne suffit normalement pas : une SNES utilise 192 Ko pour sa mémoire de travail et sa mémoire vidéo, une appli NumWorks en reçoit 149 au total.
 
-> **État : version 0.3, expérimentale.** L'appli tourne sur une vraie N0110 (système 25.2.0). La version 0.1 y faisait tourner Super Mario World à 43 % de sa vitesse, avec 7 images affichées par seconde ; le cœur a été réécrit depuis pour le petit cache de la calculatrice. Avec la version 0.3, un jeu de plus de 2,5 Mo installé en deux parties (2556 Ko dans l'autre moitié de la flash) y a été mesuré à 99 % de sa vitesse, 39 images affichées par seconde. C'est **une seule mesure, sur une seule calculatrice** : rien n'est connu des autres modèles ni des autres versions du système.
+> **État : version 0.3, expérimentale.** L'appli tourne sur une vraie N0110 (système 25.2.0). La version 0.1 y faisait tourner Super Mario World à 43 % de sa vitesse, avec 7 images affichées par seconde ; le cœur a été réécrit depuis pour le petit cache de la calculatrice. Avec la version 0.3, Donkey Kong Country (4 Mo, installé en deux parties dont 2556 Ko dans l'autre moitié de la flash) y tourne en plein niveau à 99 % de sa vitesse, avec 39 images affichées par seconde. C'est **une seule mesure, sur une seule calculatrice** : rien n'est connu des autres modèles ni des autres versions du système.
 
 L'outil PC qui prépare un jeu et l'installe est dans un dépôt séparé : **snes2nw**.
 
@@ -30,7 +30,7 @@ Mesuré avec les applis `make diag` et `make probe` :
 | RAM laissée aux applis externes | 149 Ko |
 | Zone des applis en flash | 2560 Ko dans chacune des deux moitiés |
 | L'autre moitié de la flash | lisible par une appli ; sa zone d'applis est inscriptible par USB |
-| Jeu en deux parties, version 0.3 | 99 % de sa vitesse, 39 images affichées par seconde (une mesure) |
+| Donkey Kong Country en plein niveau, version 0.3 | 99 % de sa vitesse, 39 images affichées par seconde (une mesure) |
 | Accès à la flash hors du cache | environ 0,95 µs |
 | Accès à la RAM hors du cache | environ 33 ns |
 | Caches du processeur | 8 Ko pour le code, 8 Ko pour les données |
@@ -69,7 +69,7 @@ Vitesse, en instructions ARM par image (code de l'appli exécuté sur un Cortex-
 | Super Mario World | 2,0 millions | 0,8 million |
 | Donkey Kong Country | 4,4 millions | 1,1 million |
 
-Le temps réel dépend surtout des accès à la flash qui manquent le cache, que QEMU ne connaît pas : le banc d'essai les compte avec un modèle du cache (`CACHESIM`). Avec les temps mesurés sur la calculatrice, ce modèle donne environ 15 ms par image pour Super Mario World en dessinant une image sur deux (la vitesse normale, à 30 images affichées par seconde) et 24 ms pour Donkey Kong Country en dessinant une image sur trois (70 à 80 % de sa vitesse). La seule mesure faite sur calculatrice avec cette version (99 %, 39 images par seconde) est meilleure que ce modèle ; elle n'a pas été faite dans les conditions du banc d'essai, et le modèle reste à confronter proprement.
+Le temps réel dépend surtout des accès à la flash qui manquent le cache, que QEMU ne connaît pas : le banc d'essai les compte avec un modèle du cache (`CACHESIM`). Avec les temps mesurés sur la calculatrice, ce modèle donne environ 15 ms par image pour Super Mario World en dessinant une image sur deux (la vitesse normale, à 30 images affichées par seconde) et 24 ms pour Donkey Kong Country en dessinant une image sur trois (70 à 80 % de sa vitesse). **Ce modèle est trop pessimiste** : sur la calculatrice, Donkey Kong Country tourne en plein niveau à 99 % de sa vitesse en dessinant deux images sur trois, à peu près deux fois plus vite que prévu. Le temps compté par instruction, calé sur la version 0.1, est sans doute trop élevé pour le cœur actuel ; il reste à recaler sur une mesure faite dans les conditions du banc d'essai.
 
 ## Limites connues
 
